@@ -31,3 +31,10 @@ python3 -m venv .venv
 
 Tests drive the bridge core through fake `Telegram`, `Pi` and `Clock` ports and
 never touch the real Telegram API or start a real `pi` run.
+
+## Running as a service
+
+The repo ships its systemd unit and the environment file it reads, under
+`deploy/`. See [`deploy/README.md`](deploy/README.md) for the deployment
+contract, the paths the unit expects provisioning to create, and the on-host
+acceptance checks.

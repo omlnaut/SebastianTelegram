@@ -1,0 +1,28 @@
+[Unit]
+Description=SebastianTelegram bridge for the pi agent
+Documentation=https://github.com/omlnaut/SebastianTelegram
+After=network-online.target
+Wants=network-online.target
+# Never give up restarting: the bridge is the only way to reach the agent.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi
+Environment=HOME=/home/pi
+EnvironmentFile=/etc/sebastian-telegram/env
+# The console script, executed directly: no shell, so the main process the
+# journal and `systemctl status` show is the bridge itself.
+ExecStart=/home/pi/.local/bin/sebastian-telegram
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+SyslogIdentifier=sebastian-telegram
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
