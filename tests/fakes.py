@@ -29,6 +29,7 @@ class FakeTelegram:
         self.sent: list[SentMessage] = []
         self.documents: list[dict] = []
         self.reactions: list[tuple[int, int, str]] = []
+        self.reaction_error: Exception | None = None
         self.pending_updates: deque[list[Update]] = deque()
         self.offsets: list[int | None] = []
         self.fail_polls: list[Exception] = []
@@ -72,6 +73,10 @@ class FakeTelegram:
         )
 
     async def set_reaction(self, chat_id: int, message_id: int, emoji: str) -> None:
+        # A real Bot API call yields; doing so here keeps interleavings honest.
+        await asyncio.sleep(0)
+        if self.reaction_error is not None:
+            raise self.reaction_error
         self.reactions.append((chat_id, message_id, emoji))
 
 
@@ -82,6 +87,8 @@ class FakeTurnHandle:
         prompt: str,
         result: TurnResult,
         gate: asyncio.Event | None = None,
+        *,
+        on_finish=None,
     ) -> None:
         self.session_id = session_id
         self.prompt = prompt
@@ -90,17 +97,33 @@ class FakeTurnHandle:
         self.pid = 0
         self.process_group = 0
         self.terminated = False
+        self.gate = gate
+        self.finished = asyncio.Event()
+        self._on_finish = on_finish
 
     async def result(self) -> TurnResult:
-        if self._gate is not None:
-            await self._gate.wait()
+        if self.gate is not None:
+            await self.gate.wait()
+        if not self.finished.is_set():
+            self.finished.set()
+            if self._on_finish is not None:
+                self._on_finish()
         return self._result
 
     async def terminate(self, grace: float) -> None:
         self.terminated = True
+        if self.gate is not None:
+            self.gate.set()
 
 
 class FakePi:
+    """A Pi port that can hold turns open and report overlap.
+
+    A turn counts as active from `start()` until its handle's `result()`
+    resolves, which is how a test sees whether two `pi` processes would have
+    been running at once.
+    """
+
     def __init__(
         self,
         results: list[TurnResult] | None = None,
@@ -111,15 +134,61 @@ class FakePi:
         self.started: list[StartedTurn] = []
         self.handles: list[FakeTurnHandle] = []
         self.fail_next: list[Exception] = []
+        self.active = 0
+        self.max_active = 0
+        self.max_active_by_session: dict[str, int] = {}
+        self._active_by_session: dict[str, int] = {}
+        self._hold = 0
+        self._gates: list[asyncio.Event] = []
+
+    def hold(self, count: int = 1) -> None:
+        """Make the next `count` turns wait for `release()`."""
+        self._hold += count
+
+    def release(self, index: int = 0) -> None:
+        self._gates[index].set()
+
+    def release_all(self) -> None:
+        for gate in self._gates:
+            gate.set()
+
+    async def wait_for_starts(self, count: int) -> None:
+        while len(self.started) < count:
+            await asyncio.sleep(0)
 
     async def start(self, session_id: str, prompt: str) -> FakeTurnHandle:
         if self.fail_next:
             raise self.fail_next.pop(0)
         self.started.append(StartedTurn(session_id=session_id, prompt=prompt))
+        gate = None
+        if self._hold:
+            self._hold -= 1
+            gate = asyncio.Event()
+            self._gates.append(gate)
         result = self.results.pop(0) if self.results else TurnResult.success("ok")
-        handle = FakeTurnHandle(session_id, prompt, result, self.gate)
+        handle = FakeTurnHandle(
+            session_id,
+            prompt,
+            result,
+            gate=gate or self.gate,
+            on_finish=lambda: self._finish(session_id),
+        )
+        self._enter(session_id)
         self.handles.append(handle)
         return handle
+
+    def _enter(self, session_id: str) -> None:
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        count = self._active_by_session.get(session_id, 0) + 1
+        self._active_by_session[session_id] = count
+        self.max_active_by_session[session_id] = max(
+            self.max_active_by_session.get(session_id, 0), count
+        )
+
+    def _finish(self, session_id: str) -> None:
+        self.active -= 1
+        self._active_by_session[session_id] -= 1
 
 
 class RecordingSleeper:

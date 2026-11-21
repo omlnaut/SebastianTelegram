@@ -14,6 +14,7 @@ from .clock import Clock
 from .config import Config
 from .log import log_event
 from .pi import Pi, TurnResult
+from .scheduler import Scheduler
 from .secret import scrub
 from .state import StateStore
 from .telegram import Telegram, TelegramError, Update
@@ -78,9 +79,11 @@ class Bridge:
         self._state.load()
         self._frontier = self._state.offset()
         self._unhandled: set[int] = set()
-        # One worker per chat, enforced by a lock; the queue ticket extends
-        # this into a FIFO without ever allowing a second process per chat.
-        self._chat_locks: dict[int, asyncio.Lock] = {}
+        self._runtime_offset: int | None = self._frontier
+        # One worker per chat, holding a FIFO: a second message for a busy chat
+        # waits its turn instead of starting a second process on the session.
+        self._scheduler = Scheduler(telegram, logger, self._run_turn, secret=config.token)
+        self._pending: set[asyncio.Task[None]] = set()
 
     async def run(self) -> None:
         frontier = self._state.offset()
@@ -89,40 +92,60 @@ class Bridge:
             self._set_frontier(frontier)
         self._frontier = frontier
         self._unhandled.clear()
-        runtime_offset = frontier
+        self._runtime_offset = frontier
+        try:
+            while True:
+                updates = await self._poll(self._runtime_offset, self._config.poll_timeout)
 
-        while True:
-            updates = await self._poll(runtime_offset, self._config.poll_timeout)
+                # Advance the runtime offset past the whole batch before doing any
+                # work, so Telegram cannot re-deliver what is already in memory.
+                for update in updates:
+                    if (
+                        self._runtime_offset is None
+                        or update.update_id + 1 > self._runtime_offset
+                    ):
+                        self._runtime_offset = update.update_id + 1
+                    self._unhandled.add(update.update_id)
 
-            # Advance the runtime offset past the whole batch before doing any
-            # work, so Telegram cannot re-deliver what is already in memory.
-            for update in updates:
-                if runtime_offset is None or update.update_id + 1 > runtime_offset:
-                    runtime_offset = update.update_id + 1
-                self._unhandled.add(update.update_id)
-            for update in updates:
-                try:
-                    await self.handle_update(update)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:  # one bad update must not stop the bridge
-                    log_event(
-                        self._logger,
-                        logging.ERROR,
-                        "update_failed",
-                        chat=update.chat_id,
-                        update=update.update_id,
-                        error=scrub(f"{type(exc).__name__}: {exc}", self._config.token),
-                    )
-                    continue
+                # Dispatch without waiting: a long turn in one chat must not hold
+                # up polling, and so must not delay another chat.
+                for update in updates:
+                    self._dispatch(update)
+        finally:
+            for task in set(self._pending):
+                task.cancel()
+            await asyncio.gather(*self._pending, return_exceptions=True)
 
-                self._unhandled.discard(update.update_id)
-                self._set_frontier(self._next_frontier(runtime_offset))
+    def _dispatch(self, update: Update) -> None:
+        task = asyncio.create_task(self._handle_update_safely(update))
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
 
-    def _next_frontier(self, runtime_offset: int | None) -> int | None:
+    async def _handle_update_safely(self, update: Update) -> None:
+        try:
+            await self.handle_update(update)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # one bad update must not stop the bridge
+            # Leave the update unhandled so the persisted frontier stays behind
+            # it and a restart re-delivers it.
+            log_event(
+                self._logger,
+                logging.ERROR,
+                "update_failed",
+                chat=update.chat_id,
+                update=update.update_id,
+                error=scrub(f"{type(exc).__name__}: {exc}", self._config.token),
+            )
+            return
+
+        self._unhandled.discard(update.update_id)
+        self._set_frontier(self._next_frontier())
+
+    def _next_frontier(self) -> int | None:
         # The frontier is the first update not yet fully handled, across all
         # chats; once nothing is outstanding it catches up to the runtime one.
-        return min(self._unhandled) if self._unhandled else runtime_offset
+        return min(self._unhandled) if self._unhandled else self._runtime_offset
 
     def _set_frontier(self, frontier: int | None) -> None:
         if frontier is None or frontier == self._frontier:
@@ -152,10 +175,9 @@ class Bridge:
     async def handle_update(self, update: Update) -> None:
         if not self._is_for_us(update):
             return
-        assert update.chat_id is not None
-        lock = self._chat_locks.setdefault(update.chat_id, asyncio.Lock())
-        async with lock:
-            await self._run_turn(update)
+        # Enqueues, marks and waits for this message's own turn to finish; the
+        # chat's worker is what actually runs it.
+        await self._scheduler.submit(update)
 
     def _is_for_us(self, update: Update) -> bool:
         if update.chat_id is None or update.from_bot:
@@ -164,8 +186,8 @@ class Bridge:
             return False
         return bool(update.text and update.text.strip())
 
-    async def _run_turn(self, update: Update) -> None:
-        assert update.chat_id is not None and update.text is not None
+    async def _run_turn(self, update: Update, prompt: str) -> None:
+        assert update.chat_id is not None
         chat_id = update.chat_id
         session_id = self._state.session_for(chat_id)
         self._state.remember_session(chat_id, session_id)
@@ -180,7 +202,7 @@ class Bridge:
         )
 
         try:
-            handle = await self._pi.start(session_id, update.text)
+            handle = await self._pi.start(session_id, prompt)
             result = await handle.result()
         except OSError as exc:
             error = scrub(f"{type(exc).__name__}: {exc}", self._config.token)

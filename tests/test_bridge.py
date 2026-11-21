@@ -35,15 +35,19 @@ def make_bridge(
     allowlist: str = "7",
     results: list[TurnResult] | None = None,
     *,
+    offset: int | None = None,
     seed_offset: int | None = None,
     seed_sessions: dict[int, str] | None = None,
     gate: asyncio.Event | None = None,
     logger: logging.Logger | None = None,
 ):
     config = make_config(tmp_path, allowlist)
-    if seed_offset is not None or seed_sessions is not None:
+    # A stored offset means this is not the first start, so the poll loop
+    # serves updates instead of discarding the backlog.
+    saved_offset = offset if offset is not None else seed_offset
+    if saved_offset is not None or seed_sessions is not None:
         StateStore(config.state_path).save(
-            State(offset=seed_offset, sessions=dict(seed_sessions or {}))
+            State(offset=saved_offset, sessions=dict(seed_sessions or {}))
         )
     telegram = FakeTelegram()
     pi = FakePi(results, gate=gate)
@@ -225,8 +229,8 @@ async def test_a_failed_delivery_is_not_retried_by_the_core(tmp_path):
     bridge, telegram, pi = make_bridge(tmp_path, results=[TurnResult.success("one")])
     telegram.fail_sends.append(TelegramError("sendMessage: 502 Bad Gateway"))
 
-    with pytest.raises(TelegramError):
-        await bridge.handle_update(update(chat_id=7, text="hi"))
+    # The chat's worker reports the failure and moves on; it never re-sends.
+    await bridge.handle_update(update(chat_id=7, text="hi"))
 
     # The turn ran once; the answer was attempted once and not re-sent, so no
     # message can ever be answered twice by a retry.
@@ -529,3 +533,204 @@ async def test_a_deleted_state_file_starts_cleanly_and_loses_the_session_mapping
     output = buffer.getvalue()
     assert "event=state_reinitialised" in output
     assert "reason=missing" in output
+# --- One worker per chat: FIFO, reactions, queued framing (#6) ---
+
+HOURGLASS = "\N{HOURGLASS}"  # ⏳
+EYES = "\N{EYES}"  # 👀
+
+
+async def test_two_messages_in_quick_succession_run_one_after_the_other(tmp_path):
+    bridge, telegram, pi = make_bridge(
+        tmp_path,
+        results=[TurnResult.success("first"), TurnResult.success("second")],
+    )
+    pi.hold(1)
+
+    first = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=1, text="one"))
+    )
+    await pi.wait_for_starts(1)
+
+    second = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=2, text="two"))
+    )
+    await asyncio.sleep(0)
+    # The first turn is still in flight, so nothing else has started yet.
+    assert [turn.prompt for turn in pi.started] == ["one"]
+
+    pi.release(0)
+    await asyncio.gather(first, second)
+
+    # Same session, in arrival order, and never two processes on it at once.
+    assert [turn.session_id for turn in pi.started] == ["tg-7", "tg-7"]
+    assert [turn.prompt for turn in pi.started] == [
+        "one",
+        "(sent while you were working: two)",
+    ]
+    assert pi.max_active_by_session["tg-7"] == 1
+    assert [sent.text for sent in telegram.sent] == ["first", "second"]
+
+
+async def test_a_message_sent_mid_run_is_marked_hourglass_then_eyes(tmp_path):
+    bridge, telegram, pi = make_bridge(
+        tmp_path,
+        results=[TurnResult.success("first"), TurnResult.success("second")],
+    )
+    pi.hold(1)
+
+    first = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=1, text="one"))
+    )
+    await pi.wait_for_starts(1)
+    second = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=2, text="actually two"))
+    )
+    await asyncio.sleep(0)
+    pi.release(0)
+    await asyncio.gather(first, second)
+
+    assert telegram.reactions == [
+        (7, 1, EYES),
+        (7, 2, HOURGLASS),
+        (7, 2, EYES),
+    ]
+    assert pi.started[1].prompt == "(sent while you were working: actually two)"
+
+
+async def test_a_message_that_starts_immediately_gets_eyes_and_is_forwarded_verbatim(tmp_path):
+    bridge, telegram, pi = make_bridge(tmp_path)
+
+    await bridge.handle_update(update(chat_id=7, message_id=5, text="-not an option"))
+
+    assert telegram.reactions == [(7, 5, EYES)]
+    assert pi.started[0].prompt == "-not an option"
+
+
+async def test_queued_messages_run_in_arrival_order(tmp_path):
+    bridge, telegram, pi = make_bridge(
+        tmp_path, results=[TurnResult.success("a"), TurnResult.success("b"), TurnResult.success("c")]
+    )
+    pi.hold(1)
+
+    first = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=1, text="m1"))
+    )
+    await pi.wait_for_starts(1)
+    rest = [
+        asyncio.create_task(
+            bridge.handle_update(update(chat_id=7, message_id=n, text=f"m{n}"))
+        )
+        for n in (2, 3)
+    ]
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    pi.release(0)
+    await asyncio.gather(first, *rest)
+
+    assert [turn.prompt for turn in pi.started] == [
+        "m1",
+        "(sent while you were working: m2)",
+        "(sent while you were working: m3)",
+    ]
+    assert [sent.text for sent in telegram.sent] == ["a", "b", "c"]
+
+
+async def test_the_queue_keeps_draining_after_a_failed_turn(tmp_path):
+    failure = TurnResult(
+        text="partial",
+        stop_reason="error",
+        aborted=False,
+        exit_code=1,
+        error_summary="boom",
+    )
+    bridge, telegram, pi = make_bridge(
+        tmp_path, results=[failure, TurnResult.success("second")]
+    )
+    pi.hold(1)
+
+    first = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=1, text="break"))
+    )
+    await pi.wait_for_starts(1)
+    second = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=2, text="recover"))
+    )
+    await asyncio.sleep(0)
+    pi.release(0)
+    await asyncio.gather(first, second)
+
+    assert "exit 1" in telegram.sent[0].text
+    assert telegram.sent[1].text == "second"
+    assert telegram.sent[1].reply_to == 2
+
+
+async def test_a_long_run_in_one_chat_does_not_delay_another_chat(tmp_path):
+    bridge, telegram, pi = make_bridge(
+        tmp_path,
+        allowlist="7,8",
+        results=[TurnResult.success("long"), TurnResult.success("quick")],
+    )
+    pi.hold(1)
+
+    slow = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=1, text="slow"))
+    )
+    await pi.wait_for_starts(1)
+
+    await asyncio.wait_for(
+        bridge.handle_update(update(chat_id=8, message_id=2, text="quick")),
+        timeout=1,
+    )
+
+    assert [sent.text for sent in telegram.sent] == ["quick"]
+    assert not pi.handles[0].finished.is_set()
+
+    pi.release(0)
+    await slow
+    assert [sent.text for sent in telegram.sent] == ["quick", "long"]
+
+
+async def test_the_poll_loop_does_not_wait_for_a_running_turn(tmp_path):
+    bridge, telegram, pi = make_bridge(
+        tmp_path,
+        allowlist="7,8",
+        results=[TurnResult.success("long"), TurnResult.success("quick")],
+        offset=1,
+    )
+    pi.hold(1)
+    telegram.queue_updates(
+        [
+            update(chat_id=7, message_id=1, text="slow"),
+            update(chat_id=8, message_id=2, text="quick"),
+        ]
+    )
+
+    runner = asyncio.create_task(bridge.run())
+    try:
+        await pi.wait_for_starts(2)
+        assert [turn.session_id for turn in pi.started] == ["tg-7", "tg-8"]
+
+        pi.release(0)
+        while len(telegram.sent) < 2:
+            await asyncio.sleep(0)
+    finally:
+        runner.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await runner
+
+    assert [sent.text for sent in telegram.sent] == ["quick", "long"]
+
+
+async def test_a_failing_reaction_is_logged_and_the_turn_still_answers(tmp_path, caplog):
+    bridge, telegram, pi = make_bridge(tmp_path, results=[TurnResult.success("answered")])
+    telegram.reaction_error = RuntimeError("reaction rejected")
+
+    with caplog.at_level(logging.WARNING):
+        await bridge.handle_update(update(chat_id=7, message_id=1, text="hi"))
+
+    assert [sent.text for sent in telegram.sent] == ["answered"]
+    assert telegram.reactions == []
+    logged = [record.getMessage() for record in caplog.records]
+    assert any("event=reaction_failed" in line for line in logged)
+    assert any("reaction rejected" in line for line in logged)

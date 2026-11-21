@@ -8,6 +8,15 @@ a plain-text reply; longer answers arrive as a `.md` document whose bytes are
 exactly the UTF-8 of the final text, so nothing is split or truncated at
 Telegram's 4 096-character message limit.
 
+Each chat has one FIFO queue drained by a single worker, so a chat never has
+two `pi` processes on its session and chats never block each other. A message
+that arrives while a turn is running (or while earlier messages are waiting) is
+marked ⏳ and, once it starts, 👀; it reaches the agent framed as
+`(sent while you were working: <text>)` so it reads as a correction. A message
+picked up immediately is marked 👀 and forwarded verbatim. Reaction calls are
+best effort: a failure is logged and never blocks the turn. The queue is in
+memory, so queued work is lost on restart.
+
 ## Configuration
 
 | Variable | Default | Meaning |
