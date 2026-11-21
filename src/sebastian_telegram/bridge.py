@@ -24,16 +24,16 @@ _NOTICE_TAIL_LIMIT = 300
 #: How long the poll loop waits after the adapter has given up on a poll.
 _POLL_RETRY_DELAY = 1.0
 
+#: Command names the bridge handles itself rather than forwarding to `pi`.
 # Plain-text Bot API messages stop at 4 096 characters; 3 500 leaves room for
 # the reply and matches the settled decision.
 MAX_MESSAGE_CHARS = 3_500
 
-STOP_COMMAND = "/stop"
 NOTHING_RUNNING = "nothing is running"
 
 
 def parse_command(text: str) -> str | None:
-    """The command a text invokes, or None when it is not a command at all.
+    """The bare command name a text invokes, or None when it is not a command.
 
     Commands are exact and lowercase, and tolerate an `@botname` suffix so they
     work in group chats. The bridge compares the result with its own commands;
@@ -43,7 +43,7 @@ def parse_command(text: str) -> str | None:
     token = text.split(None, 1)[0]
     if not token.startswith("/"):
         return None
-    return token.split("@", 1)[0]
+    return token[1:].split("@", 1)[0]
 
 
 def answer_filename(chat_id: int, completed_at: float) -> str:
@@ -99,7 +99,13 @@ class Bridge:
         self._runtime_offset: int | None = self._frontier
         # One worker per chat, holding a FIFO: a second message for a busy chat
         # waits its turn instead of starting a second process on the session.
-        self._scheduler = Scheduler(telegram, logger, self._run_turn, secret=config.token)
+        self._scheduler = Scheduler(
+            telegram,
+            logger,
+            self._run_turn,
+            self._start_new_session,
+            secret=config.token,
+        )
         self._pending: set[asyncio.Task[None]] = set()
 
     async def run(self) -> None:
@@ -192,10 +198,16 @@ class Bridge:
     async def handle_update(self, update: Update) -> None:
         if not self._is_for_us(update):
             return
+        command = parse_command(update.text or "")
         # `/stop` is handled out of band: it must never queue behind the work
         # it is meant to control.
-        if parse_command(update.text or "") == STOP_COMMAND:
+        if command == "stop":
             await self._handle_stop(update)
+            return
+        if command == "new":
+            # A control marker, not out-of-band: it takes effect at its FIFO
+            # position, and never interrupts the turn that is running.
+            await self._scheduler.submit_new(update)
             return
         # Enqueues, marks and waits for this message's own turn to finish; the
         # chat's worker is what actually runs it.
@@ -223,6 +235,20 @@ class Bridge:
         if update.chat_id not in self._config.allowlist:
             return False
         return bool(update.text and update.text.strip())
+
+    async def _start_new_session(self, update: Update) -> None:
+        """Mint and persist the chat's next generation; never reuse one."""
+        assert update.chat_id is not None
+        session_id = self._state.start_new_session(update.chat_id)
+        self._state.persist()
+        log_event(
+            self._logger,
+            logging.INFO,
+            "session_new",
+            chat=update.chat_id,
+            update=update.update_id,
+            session=session_id,
+        )
 
     async def _run_turn(self, update: Update, prompt: str, turn: Turn) -> None:
         assert update.chat_id is not None

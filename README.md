@@ -17,6 +17,13 @@ picked up immediately is marked 👀 and forwarded verbatim. Reaction calls are
 best effort: a failure is logged and never blocks the turn. The queue is in
 memory, so queued work is lost on restart.
 
+`/new` (and `/new@botname`) is the only thing that ever resets a chat's session.
+It enters the same FIFO as a control marker, so messages sent before it finish
+on the old session and messages after it start on the fresh
+`tg-<chat_id>-<n>`; it never interrupts a running turn (`/stop` does that).
+The generation is persisted and only ever increases, so a restart continues the
+current session and a generation is never reused.
+
 ## Configuration
 
 | Variable | Default | Meaning |

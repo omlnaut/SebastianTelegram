@@ -40,6 +40,7 @@ def make_bridge(
     seed_sessions: dict[int, str] | None = None,
     gate: asyncio.Event | None = None,
     logger: logging.Logger | None = None,
+    clock: FakeClock | None = None,
 ):
     config = make_config(tmp_path, allowlist)
     # A stored offset means this is not the first start, so the poll loop
@@ -51,7 +52,7 @@ def make_bridge(
         )
     telegram = FakeTelegram()
     pi = FakePi(results, gate=gate)
-    clock = FakeClock()
+    clock = clock or FakeClock()
     logger = logger or logging.getLogger("test.bridge")
     logger.addHandler(logging.NullHandler())
     bridge = build_bridge(config, telegram=telegram, pi=pi, clock=clock, logger=logger)
@@ -863,3 +864,181 @@ async def test_stop_only_signals_the_running_turn_of_its_own_chat(tmp_path):
     pi.release(0)
     await running
     assert telegram.sent[-1].text == "ok"
+
+
+# --- /new: the only reset, applied at its place in the queue (#9) ---
+
+
+async def test_new_while_idle_starts_the_next_message_on_a_new_session(tmp_path):
+    bridge, telegram, pi = make_bridge(
+        tmp_path,
+        results=[TurnResult.success("old answer"), TurnResult.success("new answer")],
+    )
+
+    await bridge.handle_update(update(chat_id=7, message_id=1, text="before"))
+    await bridge.handle_update(update(chat_id=7, message_id=2, text="/new"))
+    await bridge.handle_update(update(chat_id=7, message_id=3, text="after"))
+
+    assert [turn.session_id for turn in pi.started] == ["tg-7", "tg-7-1"]
+    assert [turn.prompt for turn in pi.started] == ["before", "after"]
+    assert [sent.text for sent in telegram.sent] == ["old answer", "new answer"]
+    assert persisted_state(tmp_path).sessions == {7: "tg-7-1"}
+
+
+async def test_new_while_busy_applies_at_its_place_in_the_queue(tmp_path):
+    bridge, telegram, pi = make_bridge(
+        tmp_path,
+        results=[
+            TurnResult.success("one"),
+            TurnResult.success("two"),
+            TurnResult.success("three"),
+        ],
+    )
+    pi.hold(1)
+
+    first = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=1, text="one"))
+    )
+    await pi.wait_for_starts(1)
+
+    # Queued ahead of /new: must finish on the old session.
+    ahead = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=2, text="two"))
+    )
+    await asyncio.sleep(0)
+    new = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=3, text="/new"))
+    )
+    await asyncio.sleep(0)
+    # Queued after /new: must start on the new session.
+    after = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=4, text="three"))
+    )
+    await asyncio.sleep(0)
+
+    assert [turn.session_id for turn in pi.started] == ["tg-7"]
+    pi.release(0)
+    await asyncio.gather(first, ahead, new, after)
+
+    assert [turn.session_id for turn in pi.started] == ["tg-7", "tg-7", "tg-7-1"]
+    assert [turn.prompt for turn in pi.started] == [
+        "one",
+        "(sent while you were working: two)",
+        "(sent while you were working: three)",
+    ]
+    assert [sent.text for sent in telegram.sent] == ["one", "two", "three"]
+
+
+async def test_new_does_not_stop_or_truncate_the_running_turn(tmp_path):
+    bridge, telegram, pi = make_bridge(
+        tmp_path, results=[TurnResult.success("the whole answer")]
+    )
+    pi.hold(1)
+
+    turn = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=1, text="a long turn"))
+    )
+    await pi.wait_for_starts(1)
+
+    new = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=2, text="/new"))
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    # The turn is still the only one running, and nothing was cancelled.
+    assert pi.active == 1
+    assert pi.handles[0].terminated is False
+    assert pi.handles[0].finished.is_set() is False
+
+    pi.release(0)
+    await asyncio.gather(turn, new)
+
+    assert pi.handles[0].terminated is False
+    assert [sent.text for sent in telegram.sent] == ["the whole answer"]
+
+
+async def test_generations_increase_and_are_never_reused_across_a_restart(tmp_path):
+    first, _, first_pi = make_bridge(
+        tmp_path,
+        results=[
+            TurnResult.success("one"),
+            TurnResult.success("two"),
+            TurnResult.success("three"),
+        ],
+    )
+
+    await first.handle_update(update(chat_id=7, text="one"))
+    await first.handle_update(update(chat_id=7, text="/new"))
+    await first.handle_update(update(chat_id=7, text="two"))
+    await first.handle_update(update(chat_id=7, text="/new"))
+    await first.handle_update(update(chat_id=7, text="three"))
+
+    assert [turn.session_id for turn in first_pi.started] == ["tg-7", "tg-7-1", "tg-7-2"]
+
+    second, _, second_pi = make_bridge(
+        tmp_path,
+        results=[TurnResult.success("four"), TurnResult.success("five")],
+    )
+
+    # The mapping survives the restart, so the next message continues it.
+    await second.handle_update(update(chat_id=7, text="four"))
+    await second.handle_update(update(chat_id=7, text="/new"))
+    await second.handle_update(update(chat_id=7, text="five"))
+
+    assert [turn.session_id for turn in second_pi.started] == ["tg-7-2", "tg-7-3"]
+    assert persisted_state(tmp_path).sessions == {7: "tg-7-3"}
+
+
+async def test_new_with_a_botname_suffix_is_the_same_command(tmp_path):
+    bridge, _, pi = make_bridge(
+        tmp_path, results=[TurnResult.success("one"), TurnResult.success("two")]
+    )
+
+    await bridge.handle_update(update(chat_id=7, message_id=1, text="one"))
+    await bridge.handle_update(
+        update(chat_id=7, message_id=2, text="/new@sebastian_telegram_bot")
+    )
+    await bridge.handle_update(update(chat_id=7, message_id=3, text="two"))
+
+    assert [turn.session_id for turn in pi.started] == ["tg-7", "tg-7-1"]
+    assert [turn.prompt for turn in pi.started] == ["one", "two"]
+
+
+async def test_new_in_a_group_chat_keeps_the_sign_in_the_session_id(tmp_path):
+    bridge, _, pi = make_bridge(
+        tmp_path,
+        allowlist="-100123",
+        results=[TurnResult.success("one"), TurnResult.success("two")],
+    )
+
+    await bridge.handle_update(update(chat_id=-100123, message_id=1, text="one"))
+    await bridge.handle_update(update(chat_id=-100123, message_id=2, text="/new"))
+    await bridge.handle_update(update(chat_id=-100123, message_id=3, text="two"))
+
+    assert [turn.session_id for turn in pi.started] == ["tg--100123", "tg--100123-1"]
+    assert persisted_state(tmp_path).sessions == {-100123: "tg--100123-1"}
+
+
+async def test_a_failed_turn_and_a_day_of_idling_do_not_reset_the_session(tmp_path):
+    failure = TurnResult(
+        text="",
+        stop_reason="error",
+        aborted=False,
+        exit_code=1,
+        error_summary="boom",
+    )
+    clock = FakeClock()
+    bridge, telegram, pi = make_bridge(
+        tmp_path,
+        results=[failure, TurnResult.success("still the same session")],
+        clock=clock,
+    )
+
+    await bridge.handle_update(update(chat_id=7, message_id=1, text="break"))
+    clock.wall += 86_400
+    clock.mono += 86_400
+    await bridge.handle_update(update(chat_id=7, message_id=2, text="a day later"))
+
+    assert [turn.session_id for turn in pi.started] == ["tg-7", "tg-7"]
+    assert telegram.sent[1].text == "still the same session"

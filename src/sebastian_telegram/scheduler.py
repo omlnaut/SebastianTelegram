@@ -32,6 +32,7 @@ QUEUED_PREFIX = "sent while you were working: "
 STOP_GRACE_SECONDS = 5.0
 
 RunMessage = Callable[[Update, str, "Turn"], Awaitable[None]]
+StartNewSession = Callable[[Update], Awaitable[None]]
 
 
 def frame_prompt(text: str, *, queued: bool) -> str:
@@ -76,13 +77,24 @@ class Turn:
         return self._handle
 
 
+@dataclass
+class QueuedNewSession:
+    """A `/new` control marker, applied wherever it lands in the FIFO."""
+
+    update: Update
+    done: asyncio.Future[None]
+
+
+QueueItem = QueuedMessage | QueuedNewSession
+
+
 class _ChatWorker:
     """One FIFO and one worker task for one chat."""
 
     def __init__(self, chat_id: int, scheduler: "Scheduler") -> None:
         self.chat_id = chat_id
         self._scheduler = scheduler
-        self._queue: asyncio.Queue[QueuedMessage] = asyncio.Queue()
+        self._queue: asyncio.Queue[QueueItem] = asyncio.Queue()
         self.task: asyncio.Task[None] | None = None
         self.turn_running = False
         self.turn: Turn | None = None
@@ -92,7 +104,7 @@ class _ChatWorker:
         """A turn is running, or earlier messages are still waiting."""
         return self.turn_running or not self._queue.empty()
 
-    def put(self, item: QueuedMessage) -> None:
+    def put(self, item: QueueItem) -> None:
         self._queue.put_nowait(item)
 
     async def run(self) -> None:
@@ -112,7 +124,13 @@ class _ChatWorker:
                     self.task = None
                     return
 
-    async def _handle(self, item: QueuedMessage) -> None:
+    async def _handle(self, item: QueueItem) -> None:
+        if isinstance(item, QueuedNewSession):
+            try:
+                await self._scheduler.start_new_session(item.update)
+            except Exception as exc:  # one bad control must not wedge the chat
+                self._scheduler.log_failure(item.update, exc)
+            return
         if item.queued:
             await item.marked.wait()
             await self._scheduler.react(item.update, EYES)
@@ -122,7 +140,7 @@ class _ChatWorker:
         try:
             await self._scheduler.run_message(item.update, item.prompt, turn)
         except Exception as exc:  # one bad message must not wedge the chat
-            self._scheduler.log_failure(item, exc)
+            self._scheduler.log_failure(item.update, exc)
         finally:
             self.turn_running = False
             self.turn = None
@@ -136,12 +154,14 @@ class Scheduler:
         telegram: Telegram,
         logger: logging.Logger,
         run_message: RunMessage,
+        start_new_session: StartNewSession,
         *,
         secret: Secret | None = None,
     ) -> None:
         self._telegram = telegram
         self._logger = logger
         self.run_message = run_message
+        self.start_new_session = start_new_session
         self._secret = secret
         self._workers: dict[int, _ChatWorker] = {}
 
@@ -183,6 +203,16 @@ class Scheduler:
             await handle.terminate(grace)
         return True
 
+    async def submit_new(self, update: Update) -> None:
+        """Enqueue `/new` as a control marker and wait until it is applied."""
+        assert update.chat_id is not None
+        worker = self._worker_for(update.chat_id)
+        item = QueuedNewSession(
+            update=update, done=asyncio.get_running_loop().create_future()
+        )
+        worker.put(item)
+        await item.done
+
     async def react(self, update: Update, emoji: str) -> None:
         """Best effort: a failed reaction is logged, never fatal."""
         if update.chat_id is None or update.message_id is None:
@@ -200,13 +230,13 @@ class Scheduler:
                 error=scrub(f"{type(exc).__name__}: {exc}", self._secret),
             )
 
-    def log_failure(self, item: QueuedMessage, exc: Exception) -> None:
+    def log_failure(self, update: Update, exc: Exception) -> None:
         log_event(
             self._logger,
             logging.ERROR,
             "update_failed",
-            chat=item.update.chat_id,
-            update=item.update.update_id,
+            chat=update.chat_id,
+            update=update.update_id,
             error=scrub(f"{type(exc).__name__}: {exc}", self._secret),
         )
 
