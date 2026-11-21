@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 
 from .clock import Clock
 from .config import Config
@@ -21,6 +22,24 @@ _FAILED_STOP_REASONS = frozenset({"error", "aborted", "none"})
 _NOTICE_TAIL_LIMIT = 300
 #: How long the poll loop waits after the adapter has given up on a poll.
 _POLL_RETRY_DELAY = 1.0
+
+# Plain-text Bot API messages stop at 4 096 characters; 3 500 leaves room for
+# the reply and matches the settled decision.
+MAX_MESSAGE_CHARS = 3_500
+
+
+def answer_filename(chat_id: int, completed_at: float) -> str:
+    """A `.md` name derived from the chat ID and the completion timestamp."""
+    stamp = datetime.fromtimestamp(completed_at, tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"tg-{chat_id}-{stamp}.md"
+
+
+def truncation_warning(stop_reason: str) -> str:
+    """An explicit warning that the answer stops at the model's output limit."""
+    return (
+        f"⚠️ output truncated: the assistant hit the {stop_reason} limit, "
+        "so this answer is incomplete."
+    )
 
 
 def failure_notice(result: TurnResult) -> str:
@@ -157,12 +176,22 @@ class Bridge:
                 stderr=result.error_summary,
             )
             answer = scrub(failure_notice(result), self._config.token)
+            truncated = False
+        elif result.stop_reason == "length":
+            # A length stop still produced usable text, but it is incomplete
+            # and must be labelled as such rather than passed off as final.
+            partial = result.text.rstrip()
+            warning = truncation_warning(result.stop_reason)
+            answer = f"{partial}\n\n{warning}" if partial else warning
+            truncated = True
         elif not result.text.strip():
             answer = "(no output)"
+            truncated = False
         else:
             answer = result.text
+            truncated = False
 
-        await self._telegram.send_message(chat_id, answer, reply_to=update.message_id)
+        await self._deliver(chat_id, update.message_id, answer)
         log_event(
             self._logger,
             logging.INFO,
@@ -171,6 +200,19 @@ class Bridge:
             update=update.update_id,
             session=session_id,
             chars=len(answer),
+            truncated=truncated,
+        )
+
+    async def _deliver(self, chat_id: int, reply_to: int | None, text: str) -> None:
+        """Plain text up to the threshold, an exact `.md` document beyond it."""
+        if len(text) <= MAX_MESSAGE_CHARS:
+            await self._telegram.send_message(chat_id, text, reply_to=reply_to)
+            return
+        await self._telegram.send_document(
+            chat_id,
+            answer_filename(chat_id, self._clock.now()),
+            text.encode("utf-8"),
+            reply_to=reply_to,
         )
 
 
