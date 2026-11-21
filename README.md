@@ -65,3 +65,9 @@ Every Bot API call goes through one retrying path:
 The base URL is configurable, so `tests/test_transport_robustness.py` points
 the adapter at a local fake Bot API server and asserts the retry, backoff and
 `429` sequences without touching Telegram.
+## Running as a service
+
+The repo ships its systemd unit and the environment file it reads, under
+`deploy/`. See [`deploy/README.md`](deploy/README.md) for the deployment
+contract, the paths the unit expects provisioning to create, and the on-host
+acceptance checks.
