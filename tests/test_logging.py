@@ -3,7 +3,14 @@ import logging
 import stat
 
 from sebastian_telegram.log import RedactTokenFilter, configure_logging
-from sebastian_telegram.secret import Secret
+from sebastian_telegram.secret import Secret, scrub_exception
+
+
+def test_exception_text_has_one_scrubbed_shape():
+    rendered = scrub_exception(ValueError("bad 123:abc"), Secret("123:abc"))
+
+    assert rendered == "ValueError: bad <redacted>"
+    assert scrub_exception(ValueError("boom"), None) == "ValueError: boom"
 
 
 def test_token_is_redacted_from_log_lines():

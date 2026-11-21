@@ -68,6 +68,24 @@ async def test_get_updates_maps_messages_to_the_minimal_update_model():
     ]
 
 
+async def test_get_updates_does_not_narrow_the_update_types_it_asks_for():
+    seen = {}
+
+    def handler(request):
+        seen["request"] = request
+        return httpx.Response(200, json={"ok": True, "result": []})
+
+    await client(handler).get_updates(offset=10, timeout=30)
+
+    import json
+
+    body = json.loads(seen["request"].content)
+    # The spec never asked the adapter to filter update types; Telegram's own
+    # default set is what the bridge must see.
+    assert "allowed_updates" not in body
+    assert body == {"timeout": 30, "offset": 10}
+
+
 async def test_send_message_is_plain_text_and_replies_to_the_trigger():
     seen = {}
 

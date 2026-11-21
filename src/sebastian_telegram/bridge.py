@@ -15,19 +15,16 @@ from .config import Config
 from .log import log_event
 from .pi import Pi, TurnResult
 from .scheduler import ChatStatus, Scheduler, Turn
-from .secret import scrub
+from .secret import scrub, scrub_exception
 from .state import StateStore
 from .telegram import Telegram, TelegramError, Update
 
 _FAILED_STOP_REASONS = frozenset({"error", "aborted", "none"})
 _NOTICE_TAIL_LIMIT = 300
-#: How long the poll loop waits after the adapter has given up on a poll.
-_POLL_RETRY_DELAY = 1.0
 
-#: Command names the bridge handles itself rather than forwarding to `pi`.
-# Plain-text Bot API messages stop at 4 096 characters; 3 500 leaves room for
-# the reply and matches the settled decision.
-MAX_MESSAGE_CHARS = 3_500
+#: Plain-text Bot API messages stop at 4 096 characters; 3 500 leaves room for
+#: the reply and matches the settled decision.
+_MAX_MESSAGE_CHARS = 3_500
 
 NOTHING_RUNNING = "nothing is running"
 
@@ -134,6 +131,11 @@ class Bridge:
         try:
             while True:
                 updates = await self._poll(self._runtime_offset, self._config.poll_timeout)
+                if updates is None:
+                    # The adapter already retried and gave up: one logged
+                    # failure, then poll again. The bridge keeps no retry
+                    # policy of its own.
+                    continue
 
                 # Advance the runtime offset past the whole batch before doing any
                 # work, so Telegram cannot re-deliver what is already in memory.
@@ -173,7 +175,7 @@ class Bridge:
                 "update_failed",
                 chat=update.chat_id,
                 update=update.update_id,
-                error=scrub(f"{type(exc).__name__}: {exc}", self._config.token),
+                error=scrub_exception(exc, self._config.token),
             )
             return
 
@@ -192,20 +194,22 @@ class Bridge:
         self._state.set_offset(frontier)
         self._state.persist()
 
-    async def _poll(self, offset: int | None, timeout: int) -> list[Update]:
-        """One long-poll; a dropped connection is retried, never fatal."""
-        while True:
-            try:
-                return await self._telegram.get_updates(offset, timeout)
-            except TelegramError as exc:
-                log_event(self._logger, logging.ERROR, "poll_failed", error=str(exc))
-                await asyncio.sleep(_POLL_RETRY_DELAY)
+    async def _poll(self, offset: int | None, timeout: int) -> list[Update] | None:
+        """One long-poll; the adapter owns retries, so a terminal failure is
+        only logged and the caller decides whether to poll again."""
+        try:
+            return await self._telegram.get_updates(offset, timeout)
+        except TelegramError as exc:
+            log_event(self._logger, logging.ERROR, "poll_failed", error=str(exc))
+            return None
 
     async def _discard_backlog(self) -> int | None:
         """First start: drain and drop whatever Telegram still holds."""
         offset: int | None = None
         while True:
             updates = await self._poll(offset, 0)
+            if updates is None:
+                continue
             if not updates:
                 return offset
             offset = max(update.update_id for update in updates) + 1
@@ -311,7 +315,7 @@ class Bridge:
             # Nothing to kill, but a `/stop` that raced the spawn must not wait
             # on a handle that will never exist.
             turn.attach(None)
-            error = scrub(f"{type(exc).__name__}: {exc}", self._config.token)
+            error = scrub_exception(exc, self._config.token)
             log_event(
                 self._logger,
                 logging.ERROR,
@@ -328,6 +332,9 @@ class Bridge:
 
         turn.attach(handle)
         result = await handle.result()
+        # The result is in hand: from here only delivery is left, so a later
+        # `/stop` has nothing to terminate and must not withhold the answer.
+        turn.completed = True
 
         if turn.stop_requested:
             # An intentional abort is not a failure and its partial output is
@@ -342,6 +349,7 @@ class Bridge:
             )
             return
 
+        truncated = False
         if _failed(result):
             log_event(
                 self._logger,
@@ -355,7 +363,6 @@ class Bridge:
                 stderr=result.error_summary,
             )
             answer = scrub(failure_notice(result), self._config.token)
-            truncated = False
         elif result.stop_reason == "length":
             # A length stop still produced usable text, but it is incomplete
             # and must be labelled as such rather than passed off as final.
@@ -365,10 +372,8 @@ class Bridge:
             truncated = True
         elif not result.text.strip():
             answer = "(no output)"
-            truncated = False
         else:
             answer = result.text
-            truncated = False
 
         await self._deliver(chat_id, update.message_id, answer)
         log_event(
@@ -384,7 +389,7 @@ class Bridge:
 
     async def _deliver(self, chat_id: int, reply_to: int | None, text: str) -> None:
         """Plain text up to the threshold, an exact `.md` document beyond it."""
-        if len(text) <= MAX_MESSAGE_CHARS:
+        if len(text) <= _MAX_MESSAGE_CHARS:
             await self._telegram.send_message(chat_id, text, reply_to=reply_to)
             return
         await self._telegram.send_document(
@@ -393,22 +398,3 @@ class Bridge:
             text.encode("utf-8"),
             reply_to=reply_to,
         )
-
-
-def build_bridge(
-    config: Config,
-    *,
-    telegram: Telegram,
-    pi: Pi,
-    clock: Clock,
-    logger: logging.Logger,
-) -> Bridge:
-    """The one composition path the service and the tests both use."""
-    return Bridge(
-        config=config,
-        telegram=telegram,
-        pi=pi,
-        clock=clock,
-        state=StateStore(config.state_path, logger=logger),
-        logger=logger,
-    )

@@ -102,6 +102,40 @@ def test_defaults_come_from_environment_paths(tmp_path):
     assert config.api_base_url == "https://api.telegram.org"
 
 
+def test_the_state_path_is_configurable_while_the_state_dir_stays_its_default_parent(tmp_path):
+    token_file = write_token(tmp_path / "token")
+    explicit = tmp_path / "elsewhere" / "offset.json"
+
+    config = load_config(
+        env_for(tmp_path, token_file, SEBASTIAN_TELEGRAM_STATE_PATH=str(explicit))
+    )
+
+    assert config.state_path == explicit
+    assert config.state_path.parent.exists()
+
+    defaulted = load_config(env_for(tmp_path, token_file))
+    assert defaulted.state_path == tmp_path / "state" / "state.json"
+
+
+def test_a_state_path_in_an_unwritable_directory_fails_loudly(tmp_path):
+    token_file = write_token(tmp_path / "token")
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(stat.S_IRUSR | stat.S_IXUSR)
+
+    try:
+        with pytest.raises(ConfigError, match="not writable"):
+            load_config(
+                env_for(
+                    tmp_path,
+                    token_file,
+                    SEBASTIAN_TELEGRAM_STATE_PATH=str(locked / "state.json"),
+                )
+            )
+    finally:
+        locked.chmod(stat.S_IRWXU)
+
+
 def test_state_directory_is_created_private(tmp_path):
     token_file = write_token(tmp_path / "token")
 

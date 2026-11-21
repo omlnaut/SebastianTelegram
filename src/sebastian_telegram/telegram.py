@@ -16,7 +16,7 @@ from typing import Any, Protocol
 import httpx
 
 from .log import log_event
-from .secret import Secret, scrub
+from .secret import Secret, scrub, scrub_exception
 
 _DEFAULT_TIMEOUT = 30.0
 
@@ -91,10 +91,7 @@ class BotApiClient:
         self._backoff_cap = backoff_cap
 
     async def get_updates(self, offset: int | None, timeout: int) -> list[Update]:
-        payload: dict[str, Any] = {
-            "timeout": timeout,
-            "allowed_updates": ["message"],
-        }
+        payload: dict[str, Any] = {"timeout": timeout}
         if offset is not None:
             payload["offset"] = offset
         result = await self._call(
@@ -163,8 +160,8 @@ class BotApiClient:
                 # are retried then.
                 delivered = not isinstance(exc, _NOT_DELIVERED)
                 if (delivered and not repeatable) or attempt >= self._max_attempts:
-                    detail = f"{method}: {type(exc).__name__}: {exc}"
-                    raise TelegramError(self._scrub(detail)) from None
+                    detail = f"{method}: {scrub_exception(exc, self._token)}"
+                    raise TelegramError(detail) from None
                 await self._retry(method, attempt, self._backoff_delay(attempt), error=exc)
                 continue
 
@@ -200,7 +197,7 @@ class BotApiClient:
         if status is not None:
             fields["status"] = status
         if error is not None:
-            fields["error"] = self._scrub(f"{type(error).__name__}: {error}")
+            fields["error"] = scrub_exception(error, self._token)
         if self._logger is not None:
             log_event(self._logger, logging.WARNING, "http_retry", **fields)
         await self._sleep(delay)

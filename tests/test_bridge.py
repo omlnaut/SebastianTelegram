@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from sebastian_telegram.bridge import build_bridge
 from sebastian_telegram.config import load_config
 from sebastian_telegram.log import configure_logging
+from sebastian_telegram.main import build_service
 from sebastian_telegram.pi import TurnResult
 from sebastian_telegram.secret import Secret
 from sebastian_telegram.state import State, StateStore
@@ -55,7 +55,7 @@ def make_bridge(
     clock = clock or FakeClock()
     logger = logger or logging.getLogger("test.bridge")
     logger.addHandler(logging.NullHandler())
-    bridge = build_bridge(config, telegram=telegram, pi=pi, clock=clock, logger=logger)
+    bridge = build_service(config, logger, telegram=telegram, pi=pi, clock=clock)
     return bridge, telegram, pi
 
 
@@ -183,61 +183,111 @@ async def test_transport_failure_between_turns_does_not_wedge_the_chat(tmp_path)
     assert [sent.text for sent in telegram.sent] == ["one", "two"]
 
 
-async def test_a_dropped_poll_resumes_without_restarting_the_service(tmp_path, monkeypatch):
-    import asyncio
-    from contextlib import suppress
-
-    from sebastian_telegram import bridge as bridge_module
+async def test_a_terminal_poll_failure_is_logged_and_the_loop_keeps_polling(tmp_path, caplog):
     from sebastian_telegram.state import State, StateStore
     from sebastian_telegram.telegram import TelegramError
 
-    monkeypatch.setattr(bridge_module, "_POLL_RETRY_DELAY", 0.01)
     # A resumed service, not a first start: it has an offset to poll from.
     StateStore(tmp_path / "state" / "state.json").save(State(offset=0, sessions={7: "tg-7"}))
-    bridge, telegram, pi = make_bridge(
-        tmp_path, results=[TurnResult.success("still here")]
-    )
+    bridge, telegram, pi = make_bridge(tmp_path, results=[TurnResult.success("still here")])
+    # The adapter has already retried and given up; the bridge must not retry
+    # again on top of that, it must log the terminal failure and poll on.
     telegram.fail_polls.append(TelegramError("getUpdates: RemoteProtocolError: reset"))
     telegram.queue_updates([update(chat_id=7, message_id=42, text="ping")])
 
-    task = asyncio.create_task(bridge.run())
-    try:
-        await _until(lambda: telegram.sent)
-    finally:
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
+    with caplog.at_level(logging.ERROR):
+        await run_until(
+            bridge,
+            lambda: telegram.sent
+            and any("event=poll_failed" in record.getMessage() for record in caplog.records),
+        )
 
     assert [sent.text for sent in telegram.sent] == ["still here"]
     assert telegram.sent[0].reply_to == 42
     assert len(pi.started) == 1
+    assert telegram.fail_polls == []
 
 
-async def _until(predicate, timeout: float = 1.0) -> None:
-    import asyncio
-
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    while not predicate():
-        if loop.time() > deadline:
-            raise AssertionError("timed out waiting for the bridge")
-        await asyncio.sleep(0.001)
-
-
-async def test_a_failed_delivery_is_not_retried_by_the_core(tmp_path):
+async def test_a_failed_poll_while_discarding_the_backlog_still_discards_it(tmp_path):
     from sebastian_telegram.telegram import TelegramError
 
-    bridge, telegram, pi = make_bridge(tmp_path, results=[TurnResult.success("one")])
-    telegram.fail_sends.append(TelegramError("sendMessage: 502 Bad Gateway"))
+    bridge, telegram, pi = make_bridge(tmp_path)
+    telegram.fail_polls.append(TelegramError("getUpdates: 502 Bad Gateway"))
+    telegram.queue_updates(
+        [
+            update(chat_id=7, message_id=1, update_id=1, text="ancient"),
+            update(chat_id=7, message_id=2, update_id=2, text="old"),
+        ]
+    )
 
-    # The chat's worker reports the failure and moves on; it never re-sends.
-    await bridge.handle_update(update(chat_id=7, text="hi"))
+    await run_until(bridge, lambda: persisted_state(tmp_path).offset == 3)
+
+    # A terminal poll failure must not abandon the drain, or first start would
+    # replay the ancient backlog it was meant to skip.
+    assert telegram.sent == []
+    assert pi.started == []
+
+
+async def test_a_failed_delivery_is_not_retried_and_leaves_the_update_unhandled(tmp_path, caplog):
+    from sebastian_telegram.telegram import TelegramError
+
+    bridge, telegram, pi = make_bridge(
+        tmp_path, seed_offset=10, results=[TurnResult.success("one")]
+    )
+    telegram.fail_sends.append(TelegramError("sendMessage: 502 Bad Gateway"))
+    telegram.queue_updates([update(chat_id=7, message_id=1, update_id=10, text="hi")])
+
+    with caplog.at_level(logging.ERROR):
+        await run_until(
+            bridge,
+            lambda: any(
+                "event=update_failed" in record.getMessage() for record in caplog.records
+            ),
+        )
 
     # The turn ran once; the answer was attempted once and not re-sent, so no
     # message can ever be answered twice by a retry.
     assert len(pi.started) == 1
     assert telegram.send_attempts == 1
     assert telegram.sent == []
+    # The answer never reached the chat, so the update is not fully handled and
+    # the persisted frontier must stay behind it.
+    assert persisted_state(tmp_path).offset == 10
+
+
+async def test_a_failed_turn_leaves_its_update_unhandled_while_the_queue_drains(tmp_path):
+    bridge, telegram, pi = make_bridge(
+        tmp_path,
+        seed_offset=10,
+        results=[TurnResult.success("second answer")],
+    )
+    pi.fail_next.append(RuntimeError("spawn exploded"))
+    telegram.queue_updates(
+        [
+            update(chat_id=7, message_id=1, update_id=10, text="break"),
+            update(chat_id=7, message_id=2, update_id=11, text="second"),
+        ]
+    )
+
+    await run_until(bridge, lambda: len(telegram.sent) == 1)
+
+    # The chat kept draining past the failure...
+    assert [sent.text for sent in telegram.sent] == ["second answer"]
+    # ...but the failed update is still unhandled, so the frontier stays behind
+    # it rather than advancing to 12.
+    assert persisted_state(tmp_path).offset == 10
+
+    restarted, restarted_telegram, restarted_pi = make_bridge(
+        tmp_path, results=[TurnResult.success("redelivered")]
+    )
+    restarted_telegram.queue_updates(
+        [update(chat_id=7, message_id=1, update_id=10, text="break")]
+    )
+
+    await run_until(restarted, lambda: len(restarted_telegram.sent) == 1)
+
+    assert restarted_telegram.offsets[0] == 10
+    assert restarted_pi.started[0].prompt == "break"
 LONG_ANSWER = "First line — with é, emoji 🚀 and `code`.\n" + ("Lorem ipsum dolor sit amet. " * 250)
 
 
@@ -501,12 +551,12 @@ def test_a_corrupt_state_file_is_logged_when_the_service_is_built(tmp_path):
 
     buffer = StringIO()
     logger = configure_logging(Secret("123:abc"), stream=buffer)
-    build_bridge(
+    build_service(
         config,
+        logger,
         telegram=FakeTelegram(),
         pi=FakePi(),
         clock=FakeClock(),
-        logger=logger,
     )
 
     output = buffer.getvalue()
@@ -768,6 +818,37 @@ async def test_stop_ends_the_running_turn_without_a_failure_notice_or_partial_ou
     assert pi.handles[0].terminated is True
     assert telegram.sent == []
     assert telegram.documents == []
+
+
+async def test_stop_after_the_process_exited_does_not_suppress_the_finished_answer(tmp_path):
+    bridge, telegram, pi = make_bridge(
+        tmp_path, results=[TurnResult.success("the finished answer")]
+    )
+    gate = asyncio.Event()
+    telegram.send_gate = gate
+
+    turn = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=1, text="job"))
+    )
+    # Wait until the turn's result is in hand and only its delivery is in
+    # flight: the process has already exited.
+    await asyncio.wait_for(telegram.send_started.wait(), timeout=1)
+
+    stop = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=2, text="/stop"))
+    )
+    await asyncio.wait_for(stop, timeout=2)
+
+    gate.set()
+    await asyncio.wait_for(turn, timeout=2)
+
+    # The finished answer was not withheld, and `/stop` reported the truth
+    # instead of claiming it ended a turn it could not terminate.
+    assert sorted(sent.text for sent in telegram.sent) == [
+        "nothing is running",
+        "the finished answer",
+    ]
+    assert pi.handles[0].terminated is False
 
 
 async def test_the_queued_correction_still_runs_after_stop(tmp_path):

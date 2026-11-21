@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from .clock import Clock
 from .log import log_event
 from .pi import TurnHandle
-from .secret import Secret, scrub
+from .secret import Secret, scrub_exception
 from .telegram import Telegram, Update
 
 #: "you are waiting behind work", set when the message is enqueued.
@@ -48,7 +48,10 @@ class QueuedMessage:
     update: Update
     prompt: str
     queued: bool
-    done: asyncio.Future[None]
+    #: Resolves to the exception that escaped handling, or `None` when the
+    #: update was fully handled. The submitter waits on it so a failure keeps
+    #: the update unhandled instead of looking like a completed turn.
+    done: asyncio.Future[Exception | None]
     #: Set once the enqueue-time reaction has settled, so 👀 cannot overtake ⏳.
     marked: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -60,10 +63,16 @@ class Turn:
     out-of-band `/stop` can terminate the turn's process group. The flag is
     what lets the bridge tell a stop it asked for apart from an abort the
     agent reported by itself.
+
+    `completed` records that the turn's result is in hand. A `/stop` that
+    arrives afterwards has nothing left to terminate, so it must not suppress
+    a finished answer or claim it stopped the turn.
     """
 
     def __init__(self, started_at: float | None = None) -> None:
         self.stop_requested = False
+        #: The result is in hand: only delivery is left to do.
+        self.completed = False
         #: Monotonic reading from the injected clock when the turn started.
         self.started_at = started_at
         self._handle: TurnHandle | None = None
@@ -85,7 +94,7 @@ class QueuedNewSession:
     """A `/new` control marker, applied wherever it lands in the FIFO."""
 
     update: Update
-    done: asyncio.Future[None]
+    done: asyncio.Future[Exception | None]
 
 
 QueueItem = QueuedMessage | QueuedNewSession
@@ -113,7 +122,6 @@ class _ChatWorker:
         self._scheduler = scheduler
         self._queue: asyncio.Queue[QueueItem] = asyncio.Queue()
         self.task: asyncio.Task[None] | None = None
-        self.turn_running = False
         self.turn: Turn | None = None
         #: Messages waiting in the FIFO, excluding `/new` control markers.
         self.waiting_messages = 0
@@ -121,7 +129,7 @@ class _ChatWorker:
     @property
     def busy(self) -> bool:
         """A turn is running, or earlier messages are still waiting."""
-        return self.turn_running or not self._queue.empty()
+        return self.turn is not None or not self._queue.empty()
 
     def put(self, item: QueueItem) -> None:
         if isinstance(item, QueuedMessage):
@@ -133,12 +141,17 @@ class _ChatWorker:
             item = await self._queue.get()
             if isinstance(item, QueuedMessage):
                 self.waiting_messages -= 1
+            failure: Exception | None = None
             try:
                 await self._handle(item)
+            except Exception as exc:  # one bad item must not wedge the chat
+                # Hand the failure back to the submitter, which leaves the
+                # update unhandled; the worker goes on draining the queue.
+                failure = exc
             finally:
                 self._queue.task_done()
                 if not item.done.done():
-                    item.done.set_result(None)
+                    item.done.set_result(failure)
                 # Exit when drained rather than idling; the next message starts
                 # a fresh worker. No await separates the check from the return,
                 # and `submit` enqueues before it looks for a worker, so an
@@ -149,23 +162,16 @@ class _ChatWorker:
 
     async def _handle(self, item: QueueItem) -> None:
         if isinstance(item, QueuedNewSession):
-            try:
-                await self._scheduler.start_new_session(item.update)
-            except Exception as exc:  # one bad control must not wedge the chat
-                self._scheduler.log_failure(item.update, exc)
+            await self._scheduler.start_new_session(item.update)
             return
         if item.queued:
             await item.marked.wait()
             await self._scheduler.react(item.update, EYES)
         turn = self._scheduler.begin_turn()
         self.turn = turn
-        self.turn_running = True
         try:
             await self._scheduler.run_message(item.update, item.prompt, turn)
-        except Exception as exc:  # one bad message must not wedge the chat
-            self._scheduler.log_failure(item.update, exc)
         finally:
-            self.turn_running = False
             self.turn = None
 
 
@@ -210,17 +216,20 @@ class Scheduler:
         finally:
             item.marked.set()
 
-        await item.done
+        failure = await item.done
+        if failure is not None:
+            raise failure
 
     async def stop(self, chat_id: int, grace: float = STOP_GRACE_SECONDS) -> bool:
         """Terminate the chat's running turn, keeping its queue.
 
-        Returns False when the chat has no turn to stop. The queue is untouched
-        on purpose: a correction typed during the run still runs next.
+        Returns False when the chat has no turn to stop, including a turn whose
+        result is already in hand and is only being delivered. The queue is
+        untouched on purpose: a correction typed during the run still runs next.
         """
         worker = self._workers.get(chat_id)
         turn = worker.turn if worker is not None else None
-        if turn is None:
+        if turn is None or turn.completed:
             return False
         turn.stop_requested = True
         handle = await turn.handle()
@@ -236,7 +245,9 @@ class Scheduler:
             update=update, done=asyncio.get_running_loop().create_future()
         )
         worker.put(item)
-        await item.done
+        failure = await item.done
+        if failure is not None:
+            raise failure
 
     def begin_turn(self) -> Turn:
         """The turn a chat's worker is about to run, stamped with the clock."""
@@ -247,10 +258,9 @@ class Scheduler:
         worker = self._workers.get(chat_id)
         if worker is None:
             return ChatStatus(running=False, started_at=None, queued=0)
-        running = worker.turn_running and worker.turn is not None
         return ChatStatus(
-            running=running,
-            started_at=worker.turn.started_at if running else None,
+            running=worker.turn is not None,
+            started_at=worker.turn.started_at if worker.turn is not None else None,
             queued=worker.waiting_messages,
         )
 
@@ -268,18 +278,8 @@ class Scheduler:
                 chat=update.chat_id,
                 message=update.message_id,
                 update=update.update_id,
-                error=scrub(f"{type(exc).__name__}: {exc}", self._secret),
+                error=scrub_exception(exc, self._secret),
             )
-
-    def log_failure(self, update: Update, exc: Exception) -> None:
-        log_event(
-            self._logger,
-            logging.ERROR,
-            "update_failed",
-            chat=update.chat_id,
-            update=update.update_id,
-            error=scrub(f"{type(exc).__name__}: {exc}", self._secret),
-        )
 
     def _worker_for(self, chat_id: int) -> _ChatWorker:
         worker = self._workers.get(chat_id)

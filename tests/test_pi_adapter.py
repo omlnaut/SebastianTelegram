@@ -1,13 +1,14 @@
 import asyncio
 import json
+import logging
 import os
 import sys
 from pathlib import Path
 
 import pytest
 
-from sebastian_telegram.bridge import build_bridge
 from sebastian_telegram.config import load_config
+from sebastian_telegram.main import build_service
 from sebastian_telegram.pi import SubprocessPi
 from sebastian_telegram.secret import Secret
 
@@ -150,8 +151,8 @@ async def test_token_never_reaches_pi_argv_or_environment(tmp_path):
         env=fake_env(fixture="final_text.jsonl", record=record),
     )
     telegram = FakeTelegram()
-    bridge = build_bridge(
-        config, telegram=telegram, pi=pi, clock=FakeClock(), logger=__import__("logging").getLogger("t")
+    bridge = build_service(
+        config, logging.getLogger("t"), telegram=telegram, pi=pi, clock=FakeClock()
     )
 
     await bridge.handle_update(update(chat_id=7, text="hello"))

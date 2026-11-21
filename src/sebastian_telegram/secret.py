@@ -43,3 +43,8 @@ def scrub(text: str, secret: Secret | None) -> str:
     if not value:
         return text
     return text.replace(value, REDACTED)
+
+
+def scrub_exception(exc: BaseException, secret: Secret | None) -> str:
+    """One error-string shape for logs and notices: `Type: message`, scrubbed."""
+    return scrub(f"{type(exc).__name__}: {exc}", secret)

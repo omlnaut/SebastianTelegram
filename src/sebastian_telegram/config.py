@@ -126,14 +126,19 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
     state_dir = Path(
         env.get("SEBASTIAN_TELEGRAM_STATE_DIR") or _default_state_dir(env)
     ).expanduser()
-    _ensure_writable_state_dir(state_dir)
+    # The directory stays the default parent; an explicit path may live
+    # anywhere, so its own parent is what startup probes for writability.
+    state_path = Path(
+        env.get("SEBASTIAN_TELEGRAM_STATE_PATH") or state_dir / "state.json"
+    ).expanduser()
+    _ensure_writable_state_dir(state_path.parent)
 
     vault_dir = Path(env.get("SEBASTIAN_TELEGRAM_VAULT_DIR") or _home(env) / "vault").expanduser()
 
     return Config(
         token=token,
         allowlist=allowlist,
-        state_path=state_dir / "state.json",
+        state_path=state_path,
         vault_dir=vault_dir,
         pi_bin=env.get("SEBASTIAN_TELEGRAM_PI_BIN") or "pi",
         poll_timeout=_parse_timeout(env.get("SEBASTIAN_TELEGRAM_POLL_TIMEOUT")),

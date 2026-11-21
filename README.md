@@ -36,15 +36,16 @@ injected clock's monotonic reading.
 |---|---|---|
 | `SEBASTIAN_TELEGRAM_TOKEN_FILE` | `$XDG_CONFIG_HOME/sebastian-telegram/token` | Bot token, mode `600` |
 | `SEBASTIAN_TELEGRAM_ALLOWLIST` | required | Comma-separated chat IDs |
-| `SEBASTIAN_TELEGRAM_STATE_DIR` | `$XDG_STATE_HOME/sebastian-telegram` | State directory |
+| `SEBASTIAN_TELEGRAM_STATE_DIR` | `$XDG_STATE_HOME/sebastian-telegram` | Parent directory of the default state path |
+| `SEBASTIAN_TELEGRAM_STATE_PATH` | `$SEBASTIAN_TELEGRAM_STATE_DIR/state.json` | State file path |
 | `SEBASTIAN_TELEGRAM_VAULT_DIR` | `~/vault` | `pi` working directory |
 | `SEBASTIAN_TELEGRAM_PI_BIN` | `pi` | `pi` executable |
 | `SEBASTIAN_TELEGRAM_POLL_TIMEOUT` | `30` | Long-poll timeout in seconds |
 | `SEBASTIAN_TELEGRAM_API_BASE_URL` | `https://api.telegram.org` | Bot API base URL |
 
 Startup validates the token file, its permissions, the allowlist and the state
-directory; misconfiguration exits with a clear message instead of failing on
-the first message.
+directory (the parent of the state path); misconfiguration exits with a clear
+message instead of failing on the first message.
 
 ## Development
 

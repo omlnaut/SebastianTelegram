@@ -35,6 +35,10 @@ class FakeTelegram:
         self.fail_polls: list[Exception] = []
         self.fail_sends: list[Exception] = []
         self.send_attempts = 0
+        #: Set when a `send_message` call has begun delivering.
+        self.send_started = asyncio.Event()
+        #: When set, the next `send_message` waits on it before recording.
+        self.send_gate: asyncio.Event | None = None
 
     def queue_updates(self, updates: list[Update]) -> None:
         self.pending_updates.append(updates)
@@ -52,6 +56,10 @@ class FakeTelegram:
         self.send_attempts += 1
         if self.fail_sends:
             raise self.fail_sends.pop(0)
+        self.send_started.set()
+        gate, self.send_gate = self.send_gate, None
+        if gate is not None:
+            await gate.wait()
         self.sent.append(SentMessage(chat_id=chat_id, text=text, reply_to=reply_to))
 
     async def send_document(

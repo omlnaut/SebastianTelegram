@@ -5,6 +5,12 @@ values from the shipped unit, runs the real entrypoint against a local fake Bot
 API and the fixture-replaying `pi` executable, SIGKILLs it, waits the declared
 `RestartSec`, and asserts the bridge is live and answers the next message. It
 never touches the real Telegram API and never starts a real `pi` run.
+
+This is deliberately kept as the composition-path proof the spec asks for: it
+starts `python -m sebastian_telegram`, so `cli()` -> `serve()` -> `build_service`
+wire the real adapters from the environment exactly as the systemd unit does.
+The failure half of that seam lives in `tests/test_startup.py`, which calls
+`serve()`/`cli()` in-process for each misconfiguration.
 """
 
 from __future__ import annotations

@@ -7,21 +7,42 @@ import logging
 import sys
 from collections.abc import Mapping
 
-from .bridge import Bridge, build_bridge
-from .clock import SystemClock
+from .bridge import Bridge
+from .clock import Clock, SystemClock
 from .config import Config, ConfigError, load_config
 from .log import configure_logging
-from .pi import SubprocessPi
-from .telegram import BotApiClient
+from .pi import Pi, SubprocessPi
+from .state import StateStore
+from .telegram import BotApiClient, Telegram
 
 
-def build_service(config: Config, logger: logging.Logger) -> Bridge:
-    """Real adapters, same composition path as the tests."""
-    return build_bridge(
-        config,
-        telegram=BotApiClient(config.token, config.api_base_url, logger=logger),
-        pi=SubprocessPi(config.pi_bin, config.vault_dir, secret=config.token),
-        clock=SystemClock(),
+def build_service(
+    config: Config,
+    logger: logging.Logger,
+    *,
+    telegram: Telegram | None = None,
+    pi: Pi | None = None,
+    clock: Clock | None = None,
+) -> Bridge:
+    """The one composition path: real adapters by default, fakes in tests.
+
+    `serve()` and the tests both build the bridge here, so the tests exercise
+    the same wiring the systemd unit starts.
+    """
+    return Bridge(
+        config=config,
+        telegram=(
+            telegram
+            if telegram is not None
+            else BotApiClient(config.token, config.api_base_url, logger=logger)
+        ),
+        pi=(
+            pi
+            if pi is not None
+            else SubprocessPi(config.pi_bin, config.vault_dir, secret=config.token)
+        ),
+        clock=clock if clock is not None else SystemClock(),
+        state=StateStore(config.state_path, logger=logger),
         logger=logger,
     )
 
