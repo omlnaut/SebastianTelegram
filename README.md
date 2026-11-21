@@ -31,3 +31,25 @@ python3 -m venv .venv
 
 Tests drive the bridge core through fake `Telegram`, `Pi` and `Clock` ports and
 never touch the real Telegram API or start a real `pi` run.
+
+## Transport behaviour
+
+Every Bot API call goes through one retrying path:
+
+- Connection errors, timeouts, `5xx` and other transient network failures are
+  retried with exponential backoff (0.5 s, 1 s, 2 s, 4 s; five attempts).
+- A `429` is obeyed: the adapter waits Telegram's `retry_after` seconds before
+  retrying instead of hammering the API.
+- A poll that dies mid-flight is retried inside the adapter, and the poll loop
+  resumes from its saved offset; a blip never restarts the service.
+- Retries cannot answer a message twice: calls that are not safe to repeat
+  (`sendMessage`, `sendDocument`) are only retried when the server explicitly
+  rejected them or the connection was never opened. A request whose outcome is
+  unknown (for example a read timeout) fails rather than being sent again.
+- Request URLs carry the token, so URLs and exception text are scrubbed before
+  they reach a log line or an error message, and a logging filter redacts the
+  token as a last line of defence.
+
+The base URL is configurable, so `tests/test_transport_robustness.py` points
+the adapter at a local fake Bot API server and asserts the retry, backoff and
+`429` sequences without touching Telegram.

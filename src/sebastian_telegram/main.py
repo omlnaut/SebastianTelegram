@@ -19,7 +19,7 @@ def build_service(config: Config, logger: logging.Logger) -> Bridge:
     """Real adapters, same composition path as the tests."""
     return build_bridge(
         config,
-        telegram=BotApiClient(config.token, config.api_base_url),
+        telegram=BotApiClient(config.token, config.api_base_url, logger=logger),
         pi=SubprocessPi(config.pi_bin, config.vault_dir, secret=config.token),
         clock=SystemClock(),
         logger=logger,

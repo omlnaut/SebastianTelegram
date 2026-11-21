@@ -4,6 +4,8 @@ import pytest
 from sebastian_telegram.secret import Secret
 from sebastian_telegram.telegram import BotApiClient, TelegramError
 
+from .fakes import RecordingSleeper
+
 TOKEN = "123:abc"
 
 
@@ -12,6 +14,7 @@ def client(handler):
         Secret(TOKEN),
         "https://api.telegram.org",
         client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        sleep=RecordingSleeper(),
     )
 
 
