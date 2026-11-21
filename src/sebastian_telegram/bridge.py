@@ -74,20 +74,37 @@ class Bridge:
         self._clock = clock
         self._state = state
         self._logger = logger
+        # Load eagerly so a missing or corrupt file is logged at startup.
+        self._state.load()
+        self._frontier = self._state.offset()
+        self._unhandled: set[int] = set()
         # One worker per chat, enforced by a lock; the queue ticket extends
         # this into a FIFO without ever allowing a second process per chat.
         self._chat_locks: dict[int, asyncio.Lock] = {}
 
     async def run(self) -> None:
-        offset = self._state.offset()
-        if offset is None:
-            offset = await self._discard_backlog()
+        frontier = self._state.offset()
+        if frontier is None:
+            frontier = await self._discard_backlog()
+            self._set_frontier(frontier)
+        self._frontier = frontier
+        self._unhandled.clear()
+        runtime_offset = frontier
+
         while True:
-            updates = await self._poll(offset, self._config.poll_timeout)
+            updates = await self._poll(runtime_offset, self._config.poll_timeout)
+
+            # Advance the runtime offset past the whole batch before doing any
+            # work, so Telegram cannot re-deliver what is already in memory.
             for update in updates:
-                offset = update.update_id + 1
+                if runtime_offset is None or update.update_id + 1 > runtime_offset:
+                    runtime_offset = update.update_id + 1
+                self._unhandled.add(update.update_id)
+            for update in updates:
                 try:
                     await self.handle_update(update)
+                except asyncio.CancelledError:
+                    raise
                 except Exception as exc:  # one bad update must not stop the bridge
                     log_event(
                         self._logger,
@@ -97,6 +114,22 @@ class Bridge:
                         update=update.update_id,
                         error=scrub(f"{type(exc).__name__}: {exc}", self._config.token),
                     )
+                    continue
+
+                self._unhandled.discard(update.update_id)
+                self._set_frontier(self._next_frontier(runtime_offset))
+
+    def _next_frontier(self, runtime_offset: int | None) -> int | None:
+        # The frontier is the first update not yet fully handled, across all
+        # chats; once nothing is outstanding it catches up to the runtime one.
+        return min(self._unhandled) if self._unhandled else runtime_offset
+
+    def _set_frontier(self, frontier: int | None) -> None:
+        if frontier is None or frontier == self._frontier:
+            return
+        self._frontier = frontier
+        self._state.set_offset(frontier)
+        self._state.persist()
 
     async def _poll(self, offset: int | None, timeout: int) -> list[Update]:
         """One long-poll; a dropped connection is retried, never fatal."""
@@ -135,6 +168,8 @@ class Bridge:
         assert update.chat_id is not None and update.text is not None
         chat_id = update.chat_id
         session_id = self._state.session_for(chat_id)
+        self._state.remember_session(chat_id, session_id)
+        self._state.persist()
         log_event(
             self._logger,
             logging.INFO,
@@ -230,6 +265,6 @@ def build_bridge(
         telegram=telegram,
         pi=pi,
         clock=clock,
-        state=StateStore(config.state_path),
+        state=StateStore(config.state_path, logger=logger),
         logger=logger,
     )

@@ -76,15 +76,24 @@ class FakeTelegram:
 
 
 class FakeTurnHandle:
-    def __init__(self, session_id: str, prompt: str, result: TurnResult) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        prompt: str,
+        result: TurnResult,
+        gate: asyncio.Event | None = None,
+    ) -> None:
         self.session_id = session_id
         self.prompt = prompt
         self._result = result
+        self._gate = gate
         self.pid = 0
         self.process_group = 0
         self.terminated = False
 
     async def result(self) -> TurnResult:
+        if self._gate is not None:
+            await self._gate.wait()
         return self._result
 
     async def terminate(self, grace: float) -> None:
@@ -92,8 +101,13 @@ class FakeTurnHandle:
 
 
 class FakePi:
-    def __init__(self, results: list[TurnResult] | None = None) -> None:
+    def __init__(
+        self,
+        results: list[TurnResult] | None = None,
+        gate: asyncio.Event | None = None,
+    ) -> None:
         self.results = list(results or [])
+        self.gate = gate
         self.started: list[StartedTurn] = []
         self.handles: list[FakeTurnHandle] = []
         self.fail_next: list[Exception] = []
@@ -103,7 +117,7 @@ class FakePi:
             raise self.fail_next.pop(0)
         self.started.append(StartedTurn(session_id=session_id, prompt=prompt))
         result = self.results.pop(0) if self.results else TurnResult.success("ok")
-        handle = FakeTurnHandle(session_id, prompt, result)
+        handle = FakeTurnHandle(session_id, prompt, result, self.gate)
         self.handles.append(handle)
         return handle
 
