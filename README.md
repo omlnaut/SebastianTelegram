@@ -24,6 +24,12 @@ on the old session and messages after it start on the fresh
 The generation is persisted and only ever increases, so a restart continues the
 current session and a generation is never reused.
 
+`/status` (and `/status@botname`) is answered out of band, like `/stop`, so it
+never queues behind the work it reports on. It replies with one short plain-text
+line: `running for <n>s, <n> queued, session <id>` while a turn runs, and
+`idle, <n> queued, session <id>` otherwise. Elapsed time is measured with the
+injected clock's monotonic reading.
+
 ## Configuration
 
 | Variable | Default | Meaning |

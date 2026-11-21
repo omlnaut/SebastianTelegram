@@ -14,7 +14,7 @@ from .clock import Clock
 from .config import Config
 from .log import log_event
 from .pi import Pi, TurnResult
-from .scheduler import Scheduler, Turn
+from .scheduler import ChatStatus, Scheduler, Turn
 from .secret import scrub
 from .state import StateStore
 from .telegram import Telegram, TelegramError, Update
@@ -72,6 +72,20 @@ def failure_notice(result: TurnResult) -> str:
     return f"{head}: {tail}" if tail else head
 
 
+def status_line(status: ChatStatus, session_id: str, clock: Clock) -> str:
+    """One short plain-text line: what is running, and how much is waiting.
+
+    Elapsed time comes from the injected clock's monotonic reading, so a test
+    can move it forward without sleeping.
+    """
+    if status.running and status.started_at is not None:
+        elapsed = max(0.0, clock.monotonic() - status.started_at)
+        head = f"running for {int(elapsed)}s"
+    else:
+        head = "idle"
+    return f"{head}, {status.queued} queued, session {session_id}"
+
+
 def _failed(result: TurnResult) -> bool:
     return result.aborted or result.exit_code != 0 or result.stop_reason in _FAILED_STOP_REASONS
 
@@ -104,6 +118,7 @@ class Bridge:
             logger,
             self._run_turn,
             self._start_new_session,
+            clock=clock,
             secret=config.token,
         )
         self._pending: set[asyncio.Task[None]] = set()
@@ -204,6 +219,11 @@ class Bridge:
         if command == "stop":
             await self._handle_stop(update)
             return
+        # `/status` is out of band for the same reason: it reports on the run
+        # it must not queue behind.
+        if command == "status":
+            await self._handle_status(update)
+            return
         if command == "new":
             # A control marker, not out-of-band: it takes effect at its FIFO
             # position, and never interrupts the turn that is running.
@@ -228,6 +248,26 @@ class Bridge:
             await self._telegram.send_message(
                 update.chat_id, NOTHING_RUNNING, reply_to=update.message_id
             )
+
+    async def _handle_status(self, update: Update) -> None:
+        assert update.chat_id is not None
+        status = self._scheduler.status(update.chat_id)
+        session_id = self._state.session_for(update.chat_id)
+        log_event(
+            self._logger,
+            logging.INFO,
+            "status_requested",
+            chat=update.chat_id,
+            update=update.update_id,
+            session=session_id,
+            running=status.running,
+            queued=status.queued,
+        )
+        await self._telegram.send_message(
+            update.chat_id,
+            status_line(status, session_id, self._clock),
+            reply_to=update.message_id,
+        )
 
     def _is_for_us(self, update: Update) -> bool:
         if update.chat_id is None or update.from_bot:
