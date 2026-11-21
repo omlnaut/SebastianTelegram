@@ -8,6 +8,7 @@ FAKE_PI_* environment variables so each test can describe one run.
 
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -37,6 +38,17 @@ def main() -> int:
     if stderr:
         sys.stderr.write(stderr)
         sys.stderr.flush()
+
+    child_pid_file = os.environ.get("FAKE_PI_CHILD_PID")
+    if child_pid_file:
+        # A tool subprocess: same process group, outliving this process unless
+        # the group as a whole is signalled.
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        Path(child_pid_file).write_text(str(child.pid))
 
     delay = float(os.environ.get("FAKE_PI_SLEEP", "0"))
     if delay:

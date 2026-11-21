@@ -13,7 +13,7 @@ from sebastian_telegram.pi import TurnResult
 from sebastian_telegram.secret import Secret
 from sebastian_telegram.state import State, StateStore
 
-from .fakes import FakeClock, FakePi, FakeTelegram, update
+from .fakes import FakeClock, FakePi, FakeTelegram, SentMessage, update
 
 
 def make_config(tmp_path: Path, allowlist: str = "7"):
@@ -734,3 +734,132 @@ async def test_a_failing_reaction_is_logged_and_the_turn_still_answers(tmp_path,
     logged = [record.getMessage() for record in caplog.records]
     assert any("event=reaction_failed" in line for line in logged)
     assert any("reaction rejected" in line for line in logged)
+
+
+# --- /stop: end the running turn, keep the queue (#7) ---
+
+#: What the real adapter reports when the bridge terminates a turn: aborted,
+#: killed by a signal, and carrying whatever partial text it had produced.
+STOPPED = TurnResult(
+    text="partial answer that must never be posted",
+    stop_reason="aborted",
+    aborted=True,
+    exit_code=-15,
+    error_summary="terminated",
+)
+
+
+async def test_stop_ends_the_running_turn_without_a_failure_notice_or_partial_output(tmp_path):
+    bridge, telegram, pi = make_bridge(tmp_path, results=[STOPPED])
+    pi.hold(1)
+
+    running = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=1, text="long job"))
+    )
+    await pi.wait_for_starts(1)
+
+    stop = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=2, text="/stop"))
+    )
+    # The chat is back to idle promptly, not after the run's own lifetime.
+    await asyncio.wait_for(asyncio.gather(running, stop), timeout=2)
+
+    assert pi.handles[0].terminated is True
+    assert telegram.sent == []
+    assert telegram.documents == []
+
+
+async def test_the_queued_correction_still_runs_after_stop(tmp_path):
+    bridge, telegram, pi = make_bridge(
+        tmp_path, results=[STOPPED, TurnResult.success("corrected")]
+    )
+    pi.hold(1)
+
+    first = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=1, text="wrong direction"))
+    )
+    await pi.wait_for_starts(1)
+    correction = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=2, text="do this instead"))
+    )
+    await asyncio.sleep(0)
+    stop = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=3, text="/stop"))
+    )
+
+    await asyncio.wait_for(asyncio.gather(first, correction, stop), timeout=2)
+
+    assert [turn.session_id for turn in pi.started] == ["tg-7", "tg-7"]
+    assert [turn.prompt for turn in pi.started] == [
+        "wrong direction",
+        "(sent while you were working: do this instead)",
+    ]
+    # The stopped turn's answer is absent; the queued correction's answer is not.
+    assert telegram.sent == [SentMessage(chat_id=7, text="corrected", reply_to=2)]
+
+
+async def test_stop_works_with_a_botname_suffix(tmp_path):
+    bridge, telegram, pi = make_bridge(tmp_path, results=[STOPPED])
+    pi.hold(1)
+
+    running = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=1, text="long job"))
+    )
+    await pi.wait_for_starts(1)
+    stop = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=2, text="/stop@sebastian_bot"))
+    )
+
+    await asyncio.wait_for(asyncio.gather(running, stop), timeout=2)
+
+    assert pi.handles[0].terminated is True
+    assert telegram.sent == []
+
+
+async def test_stop_while_idle_replies_that_nothing_is_running(tmp_path):
+    bridge, telegram, pi = make_bridge(tmp_path)
+
+    await bridge.handle_update(update(chat_id=7, message_id=9, text="/stop"))
+
+    assert pi.started == []
+    assert telegram.sent == [
+        SentMessage(chat_id=7, text="nothing is running", reply_to=9)
+    ]
+
+
+async def test_stop_is_not_forwarded_to_the_agent(tmp_path):
+    bridge, telegram, pi = make_bridge(tmp_path)
+
+    await bridge.handle_update(update(chat_id=7, message_id=9, text="/stop"))
+
+    assert pi.started == []
+
+
+async def test_stop_in_a_chat_off_the_allowlist_is_ignored_silently(tmp_path):
+    bridge, telegram, pi = make_bridge(tmp_path, allowlist="7")
+
+    await bridge.handle_update(update(chat_id=8, message_id=9, text="/stop"))
+
+    assert pi.started == []
+    assert telegram.sent == []
+
+
+async def test_stop_only_signals_the_running_turn_of_its_own_chat(tmp_path):
+    bridge, telegram, pi = make_bridge(tmp_path, allowlist="7,8")
+    pi.hold(1)
+
+    running = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=1, text="slow"))
+    )
+    await pi.wait_for_starts(1)
+
+    await asyncio.wait_for(
+        bridge.handle_update(update(chat_id=8, message_id=2, text="/stop")), timeout=1
+    )
+
+    assert telegram.sent == [SentMessage(chat_id=8, text="nothing is running", reply_to=2)]
+    assert pi.handles[0].terminated is False
+
+    pi.release(0)
+    await running
+    assert telegram.sent[-1].text == "ok"

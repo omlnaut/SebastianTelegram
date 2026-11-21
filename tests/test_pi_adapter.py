@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import sys
@@ -16,7 +17,7 @@ BIN = Path(__file__).parent / "bin" / "fake_pi.py"
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
-def fake_env(fixture=None, stderr=None, exit_code=0, record=None, sleep=None):
+def fake_env(fixture=None, stderr=None, exit_code=0, record=None, sleep=None, child_pid=None):
     env = {}
     if fixture:
         env["FAKE_PI_FIXTURE"] = str(FIXTURES / fixture)
@@ -26,6 +27,8 @@ def fake_env(fixture=None, stderr=None, exit_code=0, record=None, sleep=None):
         env["FAKE_PI_RECORD"] = str(record)
     if sleep is not None:
         env["FAKE_PI_SLEEP"] = str(sleep)
+    if child_pid is not None:
+        env["FAKE_PI_CHILD_PID"] = str(child_pid)
     env["FAKE_PI_EXIT"] = str(exit_code)
     return env
 
@@ -185,3 +188,40 @@ async def test_the_text_comes_from_the_last_message_end_never_from_deltas(tmp_pa
 
     assert result.text == "authoritative final text"
     assert "DELTA-CONTENT-MUST-NOT-WIN" not in result.text
+
+
+def _process_gone(pid: int) -> bool:
+    """True when the pid is gone or already reaped into a zombie."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return True
+    return stat.rsplit(")", 1)[1].split()[0] == "Z"
+
+
+async def test_terminate_kills_the_turns_child_processes_not_just_pi(tmp_path):
+    pid_file = tmp_path / "child.pid"
+    pi = SubprocessPi(
+        pi_bin=str(BIN),
+        cwd=tmp_path,
+        secret=Secret("123:abc"),
+        env=fake_env(sleep=30, child_pid=pid_file),
+    )
+
+    handle = await pi.start("tg-7", "run a tool")
+    for _ in range(200):
+        if pid_file.exists() and pid_file.read_text().strip():
+            break
+        await asyncio.sleep(0.01)
+    child_pid = int(pid_file.read_text())
+    assert not _process_gone(child_pid)
+
+    await handle.terminate(grace=0.2)
+    await handle.result()
+
+    # The whole process group died, not just the `pi` process that led it.
+    for _ in range(200):
+        if _process_gone(child_pid):
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("a child process survived /stop")

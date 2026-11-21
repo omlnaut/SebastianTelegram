@@ -16,6 +16,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from .log import log_event
+from .pi import TurnHandle
 from .secret import Secret, scrub
 from .telegram import Telegram, Update
 
@@ -27,7 +28,10 @@ EYES = "\N{EYES}"
 #: Queued text is framed so the agent reads it as a correction, not a new topic.
 QUEUED_PREFIX = "sent while you were working: "
 
-RunMessage = Callable[[Update, str], Awaitable[None]]
+#: How long `/stop` waits after SIGTERM before it has the group SIGKILLed.
+STOP_GRACE_SECONDS = 5.0
+
+RunMessage = Callable[[Update, str, "Turn"], Awaitable[None]]
 
 
 def frame_prompt(text: str, *, queued: bool) -> str:
@@ -47,6 +51,31 @@ class QueuedMessage:
     marked: asyncio.Event = field(default_factory=asyncio.Event)
 
 
+class Turn:
+    """The one turn a chat's worker is running right now.
+
+    The bridge attaches the handle as soon as the spawn returns, so an
+    out-of-band `/stop` can terminate the turn's process group. The flag is
+    what lets the bridge tell a stop it asked for apart from an abort the
+    agent reported by itself.
+    """
+
+    def __init__(self) -> None:
+        self.stop_requested = False
+        self._handle: TurnHandle | None = None
+        self._attached = asyncio.Event()
+
+    def attach(self, handle: TurnHandle | None) -> None:
+        """Record the handle, or `None` when the spawn itself failed."""
+        self._handle = handle
+        self._attached.set()
+
+    async def handle(self) -> TurnHandle | None:
+        """Wait for the spawn to settle; `/stop` can arrive first."""
+        await self._attached.wait()
+        return self._handle
+
+
 class _ChatWorker:
     """One FIFO and one worker task for one chat."""
 
@@ -56,6 +85,7 @@ class _ChatWorker:
         self._queue: asyncio.Queue[QueuedMessage] = asyncio.Queue()
         self.task: asyncio.Task[None] | None = None
         self.turn_running = False
+        self.turn: Turn | None = None
 
     @property
     def busy(self) -> bool:
@@ -86,13 +116,16 @@ class _ChatWorker:
         if item.queued:
             await item.marked.wait()
             await self._scheduler.react(item.update, EYES)
+        turn = Turn()
+        self.turn = turn
         self.turn_running = True
         try:
-            await self._scheduler.run_message(item.update, item.prompt)
+            await self._scheduler.run_message(item.update, item.prompt, turn)
         except Exception as exc:  # one bad message must not wedge the chat
             self._scheduler.log_failure(item, exc)
         finally:
             self.turn_running = False
+            self.turn = None
 
 
 class Scheduler:
@@ -133,6 +166,22 @@ class Scheduler:
             item.marked.set()
 
         await item.done
+
+    async def stop(self, chat_id: int, grace: float = STOP_GRACE_SECONDS) -> bool:
+        """Terminate the chat's running turn, keeping its queue.
+
+        Returns False when the chat has no turn to stop. The queue is untouched
+        on purpose: a correction typed during the run still runs next.
+        """
+        worker = self._workers.get(chat_id)
+        turn = worker.turn if worker is not None else None
+        if turn is None:
+            return False
+        turn.stop_requested = True
+        handle = await turn.handle()
+        if handle is not None:
+            await handle.terminate(grace)
+        return True
 
     async def react(self, update: Update, emoji: str) -> None:
         """Best effort: a failed reaction is logged, never fatal."""
