@@ -1042,3 +1042,160 @@ async def test_a_failed_turn_and_a_day_of_idling_do_not_reset_the_session(tmp_pa
 
     assert [turn.session_id for turn in pi.started] == ["tg-7", "tg-7"]
     assert telegram.sent[1].text == "still the same session"
+
+
+# --- /status: running, elapsed, queue depth, session (#8) ---
+
+
+async def test_status_while_idle_reports_idle_zero_queued_and_the_current_session(tmp_path):
+    bridge, telegram, pi = make_bridge(
+        tmp_path, seed_offset=5, seed_sessions={7: "tg-7-2"}
+    )
+
+    await bridge.handle_update(update(chat_id=7, message_id=9, text="/status"))
+
+    assert pi.started == []
+    assert telegram.sent == [
+        SentMessage(chat_id=7, text="idle, 0 queued, session tg-7-2", reply_to=9)
+    ]
+
+
+async def test_status_mid_run_reports_running_an_increasing_elapsed_time_and_the_queue(tmp_path):
+    clock = FakeClock()
+    bridge, telegram, pi = make_bridge(
+        tmp_path,
+        results=[TurnResult.success("done")],
+        clock=clock,
+    )
+    pi.hold(1)
+
+    running = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=1, text="slow job"))
+    )
+    await pi.wait_for_starts(1)
+
+    queued_one = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=2, text="first waiting"))
+    )
+    queued_two = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=3, text="second waiting"))
+    )
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    clock.mono += 12
+    await bridge.handle_update(update(chat_id=7, message_id=4, text="/status"))
+    clock.mono += 30
+    await bridge.handle_update(update(chat_id=7, message_id=5, text="/status"))
+
+    first, second = telegram.sent
+    assert first.text == "running for 12s, 2 queued, session tg-7"
+    assert second.text == "running for 42s, 2 queued, session tg-7"
+
+    pi.release(0)
+    await asyncio.gather(running, queued_one, queued_two)
+
+
+async def test_status_answers_immediately_even_while_a_long_turn_is_running(tmp_path):
+    bridge, telegram, pi = make_bridge(
+        tmp_path, results=[TurnResult.success("the long answer")]
+    )
+    pi.hold(1)
+
+    running = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=1, text="a long turn"))
+    )
+    await pi.wait_for_starts(1)
+
+    # The status reply lands while the turn is still running, not after it.
+    await asyncio.wait_for(
+        bridge.handle_update(update(chat_id=7, message_id=2, text="/status")), timeout=1
+    )
+    assert running.done() is False
+    assert telegram.sent == [
+        SentMessage(chat_id=7, text="running for 0s, 0 queued, session tg-7", reply_to=2)
+    ]
+
+    pi.release(0)
+    await running
+    assert [sent.text for sent in telegram.sent] == [
+        "running for 0s, 0 queued, session tg-7",
+        "the long answer",
+    ]
+
+
+async def test_status_after_the_turn_finishes_reports_idle_again(tmp_path):
+    bridge, telegram, pi = make_bridge(tmp_path, results=[TurnResult.success("done")])
+
+    await bridge.handle_update(update(chat_id=7, message_id=1, text="quick"))
+    await bridge.handle_update(update(chat_id=7, message_id=2, text="/status"))
+
+    assert telegram.sent[-1] == SentMessage(
+        chat_id=7, text="idle, 0 queued, session tg-7", reply_to=2
+    )
+
+
+async def test_status_is_one_line_of_plain_text(tmp_path):
+    bridge, telegram, _ = make_bridge(
+        tmp_path, seed_offset=5, seed_sessions={7: "tg-7-1"}
+    )
+
+    await bridge.handle_update(update(chat_id=7, message_id=9, text="/status"))
+
+    text = telegram.sent[0].text
+    assert "\n" not in text
+    assert len(text) < 100
+    # The port carries no parse_mode, so plain text is structural.
+    assert telegram.documents == []
+
+
+async def test_status_is_not_forwarded_to_the_agent(tmp_path):
+    bridge, telegram, pi = make_bridge(tmp_path)
+
+    await bridge.handle_update(update(chat_id=7, message_id=9, text="/status"))
+
+    assert pi.started == []
+
+
+async def test_status_works_with_a_botname_suffix(tmp_path):
+    bridge, telegram, pi = make_bridge(tmp_path)
+
+    await bridge.handle_update(
+        update(chat_id=7, message_id=9, text="/status@sebastian_telegram_bot")
+    )
+
+    assert pi.started == []
+    assert telegram.sent[0].text == "idle, 0 queued, session tg-7"
+
+
+async def test_status_in_a_chat_off_the_allowlist_is_ignored_silently(tmp_path):
+    bridge, telegram, pi = make_bridge(tmp_path, allowlist="7")
+
+    await bridge.handle_update(update(chat_id=8, message_id=9, text="/status"))
+
+    assert pi.started == []
+    assert telegram.sent == []
+
+
+async def test_status_reports_only_its_own_chats_run_and_queue(tmp_path):
+    bridge, telegram, pi = make_bridge(tmp_path, allowlist="7,8")
+    pi.hold(1)
+
+    running = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=1, text="slow"))
+    )
+    await pi.wait_for_starts(1)
+    waiting = asyncio.create_task(
+        bridge.handle_update(update(chat_id=7, message_id=2, text="waiting"))
+    )
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    await bridge.handle_update(update(chat_id=8, message_id=3, text="/status"))
+
+    assert telegram.sent == [
+        SentMessage(chat_id=8, text="idle, 0 queued, session tg-8", reply_to=3)
+    ]
+
+    pi.release(0)
+    await asyncio.gather(running, waiting)

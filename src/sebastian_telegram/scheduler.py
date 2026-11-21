@@ -15,6 +15,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
+from .clock import Clock
 from .log import log_event
 from .pi import TurnHandle
 from .secret import Secret, scrub
@@ -61,8 +62,10 @@ class Turn:
     agent reported by itself.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, started_at: float | None = None) -> None:
         self.stop_requested = False
+        #: Monotonic reading from the injected clock when the turn started.
+        self.started_at = started_at
         self._handle: TurnHandle | None = None
         self._attached = asyncio.Event()
 
@@ -88,6 +91,20 @@ class QueuedNewSession:
 QueueItem = QueuedMessage | QueuedNewSession
 
 
+@dataclass(frozen=True)
+class ChatStatus:
+    """What `/status` needs to know, read without waiting for a turn.
+
+    `started_at` is a monotonic reading so elapsed time cannot jump with the
+    wall clock; `queued` counts messages waiting behind the running turn, not
+    control markers.
+    """
+
+    running: bool
+    started_at: float | None
+    queued: int
+
+
 class _ChatWorker:
     """One FIFO and one worker task for one chat."""
 
@@ -98,6 +115,8 @@ class _ChatWorker:
         self.task: asyncio.Task[None] | None = None
         self.turn_running = False
         self.turn: Turn | None = None
+        #: Messages waiting in the FIFO, excluding `/new` control markers.
+        self.waiting_messages = 0
 
     @property
     def busy(self) -> bool:
@@ -105,11 +124,15 @@ class _ChatWorker:
         return self.turn_running or not self._queue.empty()
 
     def put(self, item: QueueItem) -> None:
+        if isinstance(item, QueuedMessage):
+            self.waiting_messages += 1
         self._queue.put_nowait(item)
 
     async def run(self) -> None:
         while True:
             item = await self._queue.get()
+            if isinstance(item, QueuedMessage):
+                self.waiting_messages -= 1
             try:
                 await self._handle(item)
             finally:
@@ -134,7 +157,7 @@ class _ChatWorker:
         if item.queued:
             await item.marked.wait()
             await self._scheduler.react(item.update, EYES)
-        turn = Turn()
+        turn = self._scheduler.begin_turn()
         self.turn = turn
         self.turn_running = True
         try:
@@ -156,10 +179,12 @@ class Scheduler:
         run_message: RunMessage,
         start_new_session: StartNewSession,
         *,
+        clock: Clock,
         secret: Secret | None = None,
     ) -> None:
         self._telegram = telegram
         self._logger = logger
+        self._clock = clock
         self.run_message = run_message
         self.start_new_session = start_new_session
         self._secret = secret
@@ -212,6 +237,22 @@ class Scheduler:
         )
         worker.put(item)
         await item.done
+
+    def begin_turn(self) -> Turn:
+        """The turn a chat's worker is about to run, stamped with the clock."""
+        return Turn(started_at=self._clock.monotonic())
+
+    def status(self, chat_id: int) -> ChatStatus:
+        """Read the chat's live state; never waits for a turn to finish."""
+        worker = self._workers.get(chat_id)
+        if worker is None:
+            return ChatStatus(running=False, started_at=None, queued=0)
+        running = worker.turn_running and worker.turn is not None
+        return ChatStatus(
+            running=running,
+            started_at=worker.turn.started_at if running else None,
+            queued=worker.waiting_messages,
+        )
 
     async def react(self, update: Update, emoji: str) -> None:
         """Best effort: a failed reaction is logged, never fatal."""
