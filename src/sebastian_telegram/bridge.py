@@ -14,7 +14,7 @@ from .clock import Clock
 from .config import Config
 from .log import log_event
 from .pi import Pi, TurnResult
-from .scheduler import Scheduler
+from .scheduler import Scheduler, Turn
 from .secret import scrub
 from .state import StateStore
 from .telegram import Telegram, TelegramError, Update
@@ -27,6 +27,23 @@ _POLL_RETRY_DELAY = 1.0
 # Plain-text Bot API messages stop at 4 096 characters; 3 500 leaves room for
 # the reply and matches the settled decision.
 MAX_MESSAGE_CHARS = 3_500
+
+STOP_COMMAND = "/stop"
+NOTHING_RUNNING = "nothing is running"
+
+
+def parse_command(text: str) -> str | None:
+    """The command a text invokes, or None when it is not a command at all.
+
+    Commands are exact and lowercase, and tolerate an `@botname` suffix so they
+    work in group chats. The bridge compares the result with its own commands;
+    every other slash command, and all plain text, is forwarded to the agent
+    verbatim.
+    """
+    token = text.split(None, 1)[0]
+    if not token.startswith("/"):
+        return None
+    return token.split("@", 1)[0]
 
 
 def answer_filename(chat_id: int, completed_at: float) -> str:
@@ -175,9 +192,30 @@ class Bridge:
     async def handle_update(self, update: Update) -> None:
         if not self._is_for_us(update):
             return
+        # `/stop` is handled out of band: it must never queue behind the work
+        # it is meant to control.
+        if parse_command(update.text or "") == STOP_COMMAND:
+            await self._handle_stop(update)
+            return
         # Enqueues, marks and waits for this message's own turn to finish; the
         # chat's worker is what actually runs it.
         await self._scheduler.submit(update)
+
+    async def _handle_stop(self, update: Update) -> None:
+        assert update.chat_id is not None
+        stopped = await self._scheduler.stop(update.chat_id)
+        log_event(
+            self._logger,
+            logging.INFO,
+            "stop_requested",
+            chat=update.chat_id,
+            update=update.update_id,
+            stopped=stopped,
+        )
+        if not stopped:
+            await self._telegram.send_message(
+                update.chat_id, NOTHING_RUNNING, reply_to=update.message_id
+            )
 
     def _is_for_us(self, update: Update) -> bool:
         if update.chat_id is None or update.from_bot:
@@ -186,7 +224,7 @@ class Bridge:
             return False
         return bool(update.text and update.text.strip())
 
-    async def _run_turn(self, update: Update, prompt: str) -> None:
+    async def _run_turn(self, update: Update, prompt: str, turn: Turn) -> None:
         assert update.chat_id is not None
         chat_id = update.chat_id
         session_id = self._state.session_for(chat_id)
@@ -203,8 +241,10 @@ class Bridge:
 
         try:
             handle = await self._pi.start(session_id, prompt)
-            result = await handle.result()
         except OSError as exc:
+            # Nothing to kill, but a `/stop` that raced the spawn must not wait
+            # on a handle that will never exist.
+            turn.attach(None)
             error = scrub(f"{type(exc).__name__}: {exc}", self._config.token)
             log_event(
                 self._logger,
@@ -217,6 +257,22 @@ class Bridge:
             )
             await self._telegram.send_message(
                 chat_id, f"turn failed to start: {error}", reply_to=update.message_id
+            )
+            return
+
+        turn.attach(handle)
+        result = await handle.result()
+
+        if turn.stop_requested:
+            # An intentional abort is not a failure and its partial output is
+            # not an answer: stay silent, keep the queue.
+            log_event(
+                self._logger,
+                logging.INFO,
+                "turn_stopped",
+                chat=chat_id,
+                update=update.update_id,
+                session=session_id,
             )
             return
 
