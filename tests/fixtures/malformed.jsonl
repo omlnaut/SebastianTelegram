@@ -1,0 +1,4 @@
+{"type":"session","version":3,"id":"sess-4","timestamp":"2024-12-03T14:00:00.000Z","cwd":"/vault"}
+this line is not json at all
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"survived"}],"stopReason":"stop","timestamp":1733234402000}}
+{"type":"agent_settled","aborted":false}
