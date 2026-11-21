@@ -24,9 +24,27 @@ _NOTICE_TAIL_LIMIT = 300
 #: How long the poll loop waits after the adapter has given up on a poll.
 _POLL_RETRY_DELAY = 1.0
 
+#: Command names the bridge handles itself rather than forwarding to `pi`.
+_BRIDGE_COMMANDS = frozenset({"new"})
+
 # Plain-text Bot API messages stop at 4 096 characters; 3 500 leaves room for
 # the reply and matches the settled decision.
 MAX_MESSAGE_CHARS = 3_500
+
+
+def bridge_command(text: str | None) -> str | None:
+    """The bridge-level command in `text`, tolerating a `@botname` suffix.
+
+    Parsing is exact and lowercase: anything else, including other slash
+    commands, is the agent's to handle verbatim.
+    """
+    if not text:
+        return None
+    token = text.strip()
+    if not token.startswith("/"):
+        return None
+    name = token[1:].split("@", 1)[0]
+    return name if name in _BRIDGE_COMMANDS else None
 
 
 def answer_filename(chat_id: int, completed_at: float) -> str:
@@ -82,7 +100,13 @@ class Bridge:
         self._runtime_offset: int | None = self._frontier
         # One worker per chat, holding a FIFO: a second message for a busy chat
         # waits its turn instead of starting a second process on the session.
-        self._scheduler = Scheduler(telegram, logger, self._run_turn, secret=config.token)
+        self._scheduler = Scheduler(
+            telegram,
+            logger,
+            self._run_turn,
+            self._start_new_session,
+            secret=config.token,
+        )
         self._pending: set[asyncio.Task[None]] = set()
 
     async def run(self) -> None:
@@ -175,6 +199,11 @@ class Bridge:
     async def handle_update(self, update: Update) -> None:
         if not self._is_for_us(update):
             return
+        if bridge_command(update.text) == "new":
+            # A control marker, not out-of-band: it takes effect at its FIFO
+            # position, and never interrupts the turn that is running.
+            await self._scheduler.submit_new(update)
+            return
         # Enqueues, marks and waits for this message's own turn to finish; the
         # chat's worker is what actually runs it.
         await self._scheduler.submit(update)
@@ -185,6 +214,20 @@ class Bridge:
         if update.chat_id not in self._config.allowlist:
             return False
         return bool(update.text and update.text.strip())
+
+    async def _start_new_session(self, update: Update) -> None:
+        """Mint and persist the chat's next generation; never reuse one."""
+        assert update.chat_id is not None
+        session_id = self._state.start_new_session(update.chat_id)
+        self._state.persist()
+        log_event(
+            self._logger,
+            logging.INFO,
+            "session_new",
+            chat=update.chat_id,
+            update=update.update_id,
+            session=session_id,
+        )
 
     async def _run_turn(self, update: Update, prompt: str) -> None:
         assert update.chat_id is not None

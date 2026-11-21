@@ -12,6 +12,15 @@ from pathlib import Path
 from .log import log_event
 
 
+def _generation(session_id: str, chat_id: int) -> int:
+    """The `n` of a `tg-<chat_id>-<n>` ID, or 0 for the base session."""
+    prefix = f"tg-{chat_id}-"
+    if not session_id.startswith(prefix):
+        return 0
+    suffix = session_id[len(prefix) :]
+    return int(suffix) if suffix.isdigit() else 0
+
+
 @dataclass
 class State:
     offset: int | None = None
@@ -84,6 +93,13 @@ class StateStore:
         if not self._loaded:
             self.load()
         return self._state.sessions.get(chat_id) or f"tg-{chat_id}"
+
+    def start_new_session(self, chat_id: int) -> str:
+        """Mint and remember the chat's next generation; none is ever reused."""
+        generation = _generation(self.session_for(chat_id), chat_id) + 1
+        session_id = f"tg-{chat_id}-{generation}"
+        self.remember_session(chat_id, session_id)
+        return session_id
 
     def remember_session(self, chat_id: int, session_id: str) -> None:
         if not self._loaded:
