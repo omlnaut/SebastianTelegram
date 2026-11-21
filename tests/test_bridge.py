@@ -130,3 +130,60 @@ async def test_transport_failure_between_turns_does_not_wedge_the_chat(tmp_path)
     await bridge.handle_update(update(chat_id=7, text="second"))
 
     assert [sent.text for sent in telegram.sent] == ["one", "two"]
+
+
+async def test_a_dropped_poll_resumes_without_restarting_the_service(tmp_path, monkeypatch):
+    import asyncio
+    from contextlib import suppress
+
+    from sebastian_telegram import bridge as bridge_module
+    from sebastian_telegram.state import State, StateStore
+    from sebastian_telegram.telegram import TelegramError
+
+    monkeypatch.setattr(bridge_module, "_POLL_RETRY_DELAY", 0.01)
+    # A resumed service, not a first start: it has an offset to poll from.
+    StateStore(tmp_path / "state" / "state.json").save(State(offset=0, sessions={7: "tg-7"}))
+    bridge, telegram, pi = make_bridge(
+        tmp_path, results=[TurnResult.success("still here")]
+    )
+    telegram.fail_polls.append(TelegramError("getUpdates: RemoteProtocolError: reset"))
+    telegram.queue_updates([update(chat_id=7, message_id=42, text="ping")])
+
+    task = asyncio.create_task(bridge.run())
+    try:
+        await _until(lambda: telegram.sent)
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+    assert [sent.text for sent in telegram.sent] == ["still here"]
+    assert telegram.sent[0].reply_to == 42
+    assert len(pi.started) == 1
+
+
+async def _until(predicate, timeout: float = 1.0) -> None:
+    import asyncio
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate():
+        if loop.time() > deadline:
+            raise AssertionError("timed out waiting for the bridge")
+        await asyncio.sleep(0.001)
+
+
+async def test_a_failed_delivery_is_not_retried_by_the_core(tmp_path):
+    from sebastian_telegram.telegram import TelegramError
+
+    bridge, telegram, pi = make_bridge(tmp_path, results=[TurnResult.success("one")])
+    telegram.fail_sends.append(TelegramError("sendMessage: 502 Bad Gateway"))
+
+    with pytest.raises(TelegramError):
+        await bridge.handle_update(update(chat_id=7, text="hi"))
+
+    # The turn ran once; the answer was attempted once and not re-sent, so no
+    # message can ever be answered twice by a retry.
+    assert len(pi.started) == 1
+    assert telegram.send_attempts == 1
+    assert telegram.sent == []

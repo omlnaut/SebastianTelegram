@@ -31,18 +31,26 @@ class FakeTelegram:
         self.reactions: list[tuple[int, int, str]] = []
         self.pending_updates: deque[list[Update]] = deque()
         self.offsets: list[int | None] = []
+        self.fail_polls: list[Exception] = []
+        self.fail_sends: list[Exception] = []
+        self.send_attempts = 0
 
     def queue_updates(self, updates: list[Update]) -> None:
         self.pending_updates.append(updates)
 
     async def get_updates(self, offset: int | None, timeout: int) -> list[Update]:
         self.offsets.append(offset)
+        if self.fail_polls:
+            raise self.fail_polls.pop(0)
         if self.pending_updates:
             return self.pending_updates.popleft()
         await asyncio.sleep(0)
         return []
 
     async def send_message(self, chat_id: int, text: str, reply_to: int | None = None) -> None:
+        self.send_attempts += 1
+        if self.fail_sends:
+            raise self.fail_sends.pop(0)
         self.sent.append(SentMessage(chat_id=chat_id, text=text, reply_to=reply_to))
 
     async def send_document(
@@ -98,6 +106,16 @@ class FakePi:
         handle = FakeTurnHandle(session_id, prompt, result)
         self.handles.append(handle)
         return handle
+
+
+class RecordingSleeper:
+    """Stands in for asyncio.sleep: records the delay, never waits."""
+
+    def __init__(self) -> None:
+        self.delays: list[float] = []
+
+    async def __call__(self, delay: float) -> None:
+        self.delays.append(delay)
 
 
 class FakeClock:

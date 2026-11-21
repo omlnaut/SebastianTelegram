@@ -19,6 +19,8 @@ from .telegram import Telegram, TelegramError, Update
 
 _FAILED_STOP_REASONS = frozenset({"error", "aborted", "none"})
 _NOTICE_TAIL_LIMIT = 300
+#: How long the poll loop waits after the adapter has given up on a poll.
+_POLL_RETRY_DELAY = 1.0
 
 
 def failure_notice(result: TurnResult) -> str:
@@ -62,13 +64,7 @@ class Bridge:
         if offset is None:
             offset = await self._discard_backlog()
         while True:
-            try:
-                updates = await self._telegram.get_updates(offset, self._config.poll_timeout)
-            except TelegramError as exc:
-                log_event(self._logger, logging.ERROR, "poll_failed", error=str(exc))
-                await asyncio.sleep(1)
-                continue
-
+            updates = await self._poll(offset, self._config.poll_timeout)
             for update in updates:
                 offset = update.update_id + 1
                 try:
@@ -83,11 +79,20 @@ class Bridge:
                         error=scrub(f"{type(exc).__name__}: {exc}", self._config.token),
                     )
 
+    async def _poll(self, offset: int | None, timeout: int) -> list[Update]:
+        """One long-poll; a dropped connection is retried, never fatal."""
+        while True:
+            try:
+                return await self._telegram.get_updates(offset, timeout)
+            except TelegramError as exc:
+                log_event(self._logger, logging.ERROR, "poll_failed", error=str(exc))
+                await asyncio.sleep(_POLL_RETRY_DELAY)
+
     async def _discard_backlog(self) -> int | None:
         """First start: drain and drop whatever Telegram still holds."""
         offset: int | None = None
         while True:
-            updates = await self._telegram.get_updates(offset, 0)
+            updates = await self._poll(offset, 0)
             if not updates:
                 return offset
             offset = max(update.update_id for update in updates) + 1
