@@ -3,7 +3,10 @@
 Telegram bridge for the `pi` agent: long-polls the Bot API, ignores any chat
 that is not on the allowlist, and turns each allowlisted text message into one
 `pi --mode json -p --session-id tg-<chat_id> -- <text>` turn in `~/vault`,
-replying with the final assistant text as plain text.
+replying with the final assistant text. Answers up to 3 500 characters arrive as
+a plain-text reply; longer answers arrive as a `.md` document whose bytes are
+exactly the UTF-8 of the final text, so nothing is split or truncated at
+Telegram's 4 096-character message limit.
 
 ## Configuration
 

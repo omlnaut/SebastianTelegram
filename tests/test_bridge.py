@@ -130,3 +130,145 @@ async def test_transport_failure_between_turns_does_not_wedge_the_chat(tmp_path)
     await bridge.handle_update(update(chat_id=7, text="second"))
 
     assert [sent.text for sent in telegram.sent] == ["one", "two"]
+
+
+LONG_ANSWER = "First line — with é, emoji 🚀 and `code`.\n" + ("Lorem ipsum dolor sit amet. " * 250)
+
+
+async def test_a_long_answer_arrives_as_a_markdown_document_with_no_truncated_copy(tmp_path):
+    bridge, telegram, _ = make_bridge(
+        tmp_path, results=[TurnResult.success(LONG_ANSWER)]
+    )
+    assert len(LONG_ANSWER) > 6_000
+
+    await bridge.handle_update(update(chat_id=7, message_id=42, text="write a lot"))
+
+    # No truncated copy of the answer in the chat body, only the document.
+    assert telegram.sent == []
+    assert len(telegram.documents) == 1
+    document = telegram.documents[0]
+    assert document["data"] == LONG_ANSWER.encode("utf-8")
+    assert document["filename"] == "tg-7-20231114T221320Z.md"
+    assert document["reply_to"] == 42
+
+
+async def test_a_3_000_character_answer_arrives_as_a_message_not_a_file(tmp_path):
+    answer = "b" * 3_000
+    bridge, telegram, _ = make_bridge(tmp_path, results=[TurnResult.success(answer)])
+
+    await bridge.handle_update(update(chat_id=7, message_id=43, text="write a bit"))
+
+    assert telegram.documents == []
+    assert len(telegram.sent) == 1
+    assert telegram.sent[0].text == answer
+    assert telegram.sent[0].reply_to == 43
+
+
+@pytest.mark.parametrize("length,as_document", [(3_500, False), (3_501, True)])
+async def test_the_3_500_character_threshold_decides_message_or_document(
+    tmp_path, length, as_document
+):
+    answer = "c" * length
+    bridge, telegram, _ = make_bridge(tmp_path, results=[TurnResult.success(answer)])
+
+    await bridge.handle_update(update(chat_id=7, text="boundary"))
+
+    if as_document:
+        assert telegram.sent == []
+        assert telegram.documents[0]["data"] == answer.encode("utf-8")
+    else:
+        assert telegram.documents == []
+        assert telegram.sent[0].text == answer
+
+
+async def test_a_length_stop_reason_posts_the_partial_text_with_a_truncation_warning(tmp_path):
+    partial = TurnResult(
+        text="the first half of the answer",
+        stop_reason="length",
+        aborted=False,
+        exit_code=0,
+        error_summary="",
+    )
+    bridge, telegram, _ = make_bridge(tmp_path, results=[partial])
+
+    await bridge.handle_update(update(chat_id=7, message_id=44, text="say everything"))
+
+    assert telegram.documents == []
+    text = telegram.sent[0].text
+    assert telegram.sent[0].reply_to == 44
+    assert "the first half of the answer" in text
+    assert "truncat" in text.lower()
+    assert "turn failed" not in text.lower()
+
+
+async def test_an_error_stop_reason_is_a_failure_even_though_pi_exits_zero(tmp_path):
+    failure = TurnResult(
+        text="partial output that must not be posted",
+        stop_reason="error",
+        aborted=False,
+        exit_code=0,
+        error_summary="provider exploded",
+    )
+    bridge, telegram, _ = make_bridge(tmp_path, results=[failure])
+
+    await bridge.handle_update(update(chat_id=7, message_id=45, text="break it"))
+
+    assert telegram.documents == []
+    notice = telegram.sent[0].text
+    assert telegram.sent[0].reply_to == 45
+    assert "exit 0" in notice
+    assert "provider exploded" in notice
+    assert "partial output that must not be posted" not in notice
+
+
+async def test_an_aborted_response_withholds_partial_output_and_posts_a_notice(tmp_path):
+    aborted = TurnResult(
+        text="cut off mid sentence",
+        stop_reason="aborted",
+        aborted=True,
+        exit_code=0,
+        error_summary="",
+    )
+    bridge, telegram, _ = make_bridge(tmp_path, results=[aborted])
+
+    await bridge.handle_update(update(chat_id=7, text="abort please"))
+
+    notice = telegram.sent[0].text
+    assert "aborted" in notice.lower()
+    assert "cut off mid sentence" not in notice
+
+
+async def test_a_non_zero_exit_withholds_partial_output_even_with_a_stop_reason(tmp_path):
+    failed = TurnResult(
+        text="partial output from a dead run",
+        stop_reason="stop",
+        aborted=False,
+        exit_code=3,
+        error_summary="killed by signal",
+    )
+    bridge, telegram, _ = make_bridge(tmp_path, results=[failed])
+
+    await bridge.handle_update(update(chat_id=7, text="die"))
+
+    notice = telegram.sent[0].text
+    assert "exit 3" in notice
+    assert "killed by signal" in notice
+    assert "partial output from a dead run" not in notice
+
+
+async def test_a_long_length_truncated_answer_arrives_as_a_document_carrying_the_warning(tmp_path):
+    partial = TurnResult(
+        text="d" * 4_000,
+        stop_reason="length",
+        aborted=False,
+        exit_code=0,
+        error_summary="",
+    )
+    bridge, telegram, _ = make_bridge(tmp_path, results=[partial])
+
+    await bridge.handle_update(update(chat_id=7, text="ramble"))
+
+    assert telegram.sent == []
+    data = telegram.documents[0]["data"].decode("utf-8")
+    assert data.startswith("d" * 4_000)
+    assert "truncat" in data.lower()

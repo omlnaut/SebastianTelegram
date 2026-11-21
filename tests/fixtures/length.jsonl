@@ -1,0 +1,5 @@
+{"type":"session","version":3,"id":"sess-5","timestamp":"2024-12-03T14:00:00.000Z","cwd":"/vault"}
+{"type":"agent_start"}
+{"type":"message_end","message":{"role":"user","content":"write a lot","timestamp":1733234401000}}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"thinking","thinking":"private reasoning that must not be posted"},{"type":"text","text":"partial answer"},{"type":"toolCall","id":"call_9","name":"bash","arguments":{"command":"ls"}}],"stopReason":"length","timestamp":1733234402000}}
+{"type":"agent_settled","aborted":false}

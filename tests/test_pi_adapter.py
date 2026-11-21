@@ -164,3 +164,24 @@ async def test_missing_pi_binary_surfaces_as_a_failed_turn_not_a_hang(tmp_path):
 
     with pytest.raises(OSError):
         await pi.start("tg-7", "hello")
+
+
+async def test_a_length_stop_reason_reaches_the_bridge_without_thinking_or_tools(tmp_path):
+    pi = make_pi(tmp_path, fixture="length.jsonl")
+
+    result = await (await pi.start("tg-7", "write a lot")).result()
+
+    assert result.stop_reason == "length"
+    assert result.aborted is False
+    assert result.text == "partial answer"
+    assert "private reasoning" not in result.text
+    assert "toolCall" not in result.text
+
+
+async def test_the_text_comes_from_the_last_message_end_never_from_deltas(tmp_path):
+    pi = make_pi(tmp_path, fixture="delta_stream.jsonl")
+
+    result = await (await pi.start("tg-7", "hello")).result()
+
+    assert result.text == "authoritative final text"
+    assert "DELTA-CONTENT-MUST-NOT-WIN" not in result.text
