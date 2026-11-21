@@ -5,6 +5,15 @@ that is not on the allowlist, and turns each allowlisted text message into one
 `pi --mode json -p --session-id tg-<chat_id> -- <text>` turn in `~/vault`,
 replying with the final assistant text as plain text.
 
+Each chat has one FIFO queue drained by a single worker, so a chat never has
+two `pi` processes on its session and chats never block each other. A message
+that arrives while a turn is running (or while earlier messages are waiting) is
+marked ⏳ and, once it starts, 👀; it reaches the agent framed as
+`(sent while you were working: <text>)` so it reads as a correction. A message
+picked up immediately is marked 👀 and forwarded verbatim. Reaction calls are
+best effort: a failure is logged and never blocks the turn. The queue is in
+memory, so queued work is lost on restart.
+
 ## Configuration
 
 | Variable | Default | Meaning |

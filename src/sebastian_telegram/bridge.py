@@ -13,6 +13,7 @@ from .clock import Clock
 from .config import Config
 from .log import log_event
 from .pi import Pi, TurnResult
+from .scheduler import Scheduler
 from .secret import scrub
 from .state import StateStore
 from .telegram import Telegram, TelegramError, Update
@@ -53,35 +54,55 @@ class Bridge:
         self._clock = clock
         self._state = state
         self._logger = logger
-        # One worker per chat, enforced by a lock; the queue ticket extends
-        # this into a FIFO without ever allowing a second process per chat.
-        self._chat_locks: dict[int, asyncio.Lock] = {}
+        # One worker per chat, holding a FIFO: a second message for a busy chat
+        # waits its turn instead of starting a second process on the session.
+        self._scheduler = Scheduler(telegram, logger, self._run_turn, secret=config.token)
+        self._pending: set[asyncio.Task[None]] = set()
 
     async def run(self) -> None:
         offset = self._state.offset()
         if offset is None:
             offset = await self._discard_backlog()
-        while True:
-            try:
-                updates = await self._telegram.get_updates(offset, self._config.poll_timeout)
-            except TelegramError as exc:
-                log_event(self._logger, logging.ERROR, "poll_failed", error=str(exc))
-                await asyncio.sleep(1)
-                continue
-
-            for update in updates:
-                offset = update.update_id + 1
+        try:
+            while True:
                 try:
-                    await self.handle_update(update)
-                except Exception as exc:  # one bad update must not stop the bridge
-                    log_event(
-                        self._logger,
-                        logging.ERROR,
-                        "update_failed",
-                        chat=update.chat_id,
-                        update=update.update_id,
-                        error=scrub(f"{type(exc).__name__}: {exc}", self._config.token),
+                    updates = await self._telegram.get_updates(
+                        offset, self._config.poll_timeout
                     )
+                except TelegramError as exc:
+                    log_event(self._logger, logging.ERROR, "poll_failed", error=str(exc))
+                    await asyncio.sleep(1)
+                    continue
+
+                for update in updates:
+                    offset = update.update_id + 1
+                    # Dispatch without waiting: a long turn in one chat must not
+                    # hold up polling, and so must not delay another chat.
+                    self._dispatch(update)
+        finally:
+            for task in set(self._pending):
+                task.cancel()
+            await asyncio.gather(*self._pending, return_exceptions=True)
+
+    def _dispatch(self, update: Update) -> None:
+        task = asyncio.create_task(self._handle_update_safely(update))
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
+
+    async def _handle_update_safely(self, update: Update) -> None:
+        try:
+            await self.handle_update(update)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # one bad update must not stop the bridge
+            log_event(
+                self._logger,
+                logging.ERROR,
+                "update_failed",
+                chat=update.chat_id,
+                update=update.update_id,
+                error=scrub(f"{type(exc).__name__}: {exc}", self._config.token),
+            )
 
     async def _discard_backlog(self) -> int | None:
         """First start: drain and drop whatever Telegram still holds."""
@@ -95,10 +116,9 @@ class Bridge:
     async def handle_update(self, update: Update) -> None:
         if not self._is_for_us(update):
             return
-        assert update.chat_id is not None
-        lock = self._chat_locks.setdefault(update.chat_id, asyncio.Lock())
-        async with lock:
-            await self._run_turn(update)
+        # Enqueues, marks and waits for this message's own turn to finish; the
+        # chat's worker is what actually runs it.
+        await self._scheduler.submit(update)
 
     def _is_for_us(self, update: Update) -> bool:
         if update.chat_id is None or update.from_bot:
@@ -107,8 +127,8 @@ class Bridge:
             return False
         return bool(update.text and update.text.strip())
 
-    async def _run_turn(self, update: Update) -> None:
-        assert update.chat_id is not None and update.text is not None
+    async def _run_turn(self, update: Update, prompt: str) -> None:
+        assert update.chat_id is not None
         chat_id = update.chat_id
         session_id = self._state.session_for(chat_id)
         log_event(
@@ -121,7 +141,7 @@ class Bridge:
         )
 
         try:
-            handle = await self._pi.start(session_id, update.text)
+            handle = await self._pi.start(session_id, prompt)
             result = await handle.result()
         except OSError as exc:
             error = scrub(f"{type(exc).__name__}: {exc}", self._config.token)
